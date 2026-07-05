@@ -1,0 +1,77 @@
+# nut-dog config (mounted at /config/config.yaml). Single source of truth for
+# both the controller and the pod's NUT server config, which is generated from
+# this file. Adding a UPS or a server is a config block here — no code, no
+# templates. Secret VALUES come from env (k8s secret), referenced by *Env fields.
+pollInterval: 15s
+dryRun: true # first rollout: log intended actions, execute nothing
+
+# This pod's own upsd: serves the local drivers + the per-server shed signals.
+localUpsd:
+  listen: "0.0.0.0:3493" # hostNetwork → the node's IP; external secondaries reach it here
+  adminUser: nutdog # upsd user the controller uses to drive shed signals (SET)
+  adminPasswordEnv: NUTDOG_UPSD_PASSWORD
+
+upses:
+  # UPS-A: driven locally by snmp-ups (the RMCARD). The `driver` block is
+  # rendered into ups.conf; `host` is where the controller then reads it (its own
+  # upsd on loopback).
+  ups-a:
+    host: localhost:3493
+    upsName: ups-a
+    shedRuntime: 5m # shed when on battery AND runtime <= this
+    shedChargePct: 0 # 0 = ignore charge, runtime only
+    recoverChargePct: 5 # power back only when online AND charge >= this
+    driver:
+      type: snmp-ups
+      port: ups-a.hla1.jhofer.lan # the RMCARD address
+      options:
+        snmp_version: v3
+        secLevel: authPriv
+        secName: snmp1
+        authProtocol: SHA
+        privProtocol: AES
+        pollfreq: "15"
+      secretOptions: # driver option -> env var holding its secret value
+        authPassword: SNMP_A_AUTH_PW
+        privPassword: SNMP_A_PRIV_PW
+
+  # UPS-B: remote UniFi NUT server, polled directly (no local driver block).
+  ups-b:
+    host: ups-b.hla1.jhofer.lan:3493
+    upsName: nut
+    tls: true
+    insecure: true # self-signed cert
+    usernameEnv: UPSB_USERNAME
+    passwordEnv: UPSB_PASSWORD
+    shedRuntime: 5m
+    shedChargePct: 0
+    recoverChargePct: 5
+
+loads:
+  # BC1 blade chassis: racadm over SSH to the CMC (service key).
+  bc1:
+    type: chassis
+    governedBy: [ups-a]
+    cmc:
+      host: bc1-cmc.hla1.jhofer.lan
+      sshUser: service
+      # hostKey: "ssh-ed25519 AAAA..."  # optional: pin the CMC host key (else verification is off)
+
+  # p1: sheds if EITHER UPS is critical; wakes only when both are healthy.
+  # Sheds over NUT (its upsmon watches shed-p1 on this pod's upsd); wakes via WoL.
+  p1:
+    type: nut-server
+    governedBy: [ups-a, ups-b]
+    wake: { mac: "98:b7:85:20:77:6b", broadcast: "10.1.1.255:9" }
+    probe: { host: pve-1.hla1.jhofer.lan:22 } # TCP reachability = up
+    secondary: { user: p1, passwordEnv: P1_SECONDARY_PW } # p1's upsmon login
+
+  # Adding another server later is JUST this block (+ its secret P2_SECONDARY_PW):
+  # p2:
+  #   type: nut-server
+  #   governedBy: [ups-a, ups-b]
+  #   wake:  { mac: "...", broadcast: "10.1.1.255:9" }
+  #   probe: { host: pve-2.hla1.jhofer.lan:22 }
+  #   secondary: { user: p2, passwordEnv: P2_SECONDARY_PW }
+# Controller env (k8s secret): NUTDOG_UPSD_PASSWORD, SNMP_A_AUTH_PW, SNMP_A_PRIV_PW,
+# UPSB_USERNAME, UPSB_PASSWORD, CMC_SSH_KEY (PEM), P1_SECONDARY_PW.
