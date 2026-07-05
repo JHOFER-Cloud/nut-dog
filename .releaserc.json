@@ -1,0 +1,14 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/exec",
+      {
+        "publishCmd": "docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/jhofer-cloud/nut-dog:${nextRelease.version} -t ghcr.io/jhofer-cloud/nut-dog:latest --push ."
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}

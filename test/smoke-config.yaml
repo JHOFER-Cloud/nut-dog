@@ -1,0 +1,27 @@
+# Minimal config for the image smoke test: exercises config parsing + NUT config
+# rendering in the built image without needing any real hardware. Secret envs
+# (ADMIN_PW, SNMP_A_AUTH_PW, SNMP_A_PRIV_PW, P1_PW) are supplied as dummies.
+pollInterval: 5s
+dryRun: true
+localUpsd:
+  listen: "127.0.0.1:3493"
+  adminUser: admin
+  adminPasswordEnv: ADMIN_PW
+upses:
+  ups-a:
+    host: 127.0.0.1:3493
+    upsName: ups-a
+    shedRuntime: 5m
+    recoverChargePct: 5
+    driver:
+      type: snmp-ups
+      port: rmcard.example
+      options: { snmp_version: v3, secName: x }
+      secretOptions: { authPassword: SNMP_A_AUTH_PW, privPassword: SNMP_A_PRIV_PW }
+loads:
+  p1:
+    type: nut-server
+    governedBy: [ups-a]
+    wake: { mac: "00:11:22:33:44:55", broadcast: "127.0.0.1:9" }
+    probe: { host: 127.0.0.1:22 }
+    secondary: { user: p1, passwordEnv: P1_PW }
