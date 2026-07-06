@@ -2,7 +2,7 @@
 # controller; the image also carries NUT's server side (upsd + snmp-ups +
 # dummy-ups), which the entrypoint configures from env and starts before the
 # controller. nut-dog itself speaks NUT/SSH/WoL in Go, so no client tools needed.
-FROM golang:1.25-bookworm AS build
+FROM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
