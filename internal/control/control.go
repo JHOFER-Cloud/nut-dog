@@ -141,6 +141,19 @@ const (
 	ActualDown
 )
 
+// ShedState is the observed position of a NUT server's shed signal — the
+// ups.status nut-dog last drove onto that server's dummy-ups, read back from the
+// local upsd. Knowing it lets the reconcile stay edge-triggered like the chassis:
+// it re-drives the signal only when the observed position disagrees with what the
+// desired state needs, so a healthy steady state emits nothing.
+type ShedState int
+
+const (
+	ShedUnknown  ShedState = iota // couldn't read the signal — re-drive, erring toward the desired action
+	ShedAsserted                  // signal is critical: the server is being told to shut down
+	ShedReleased                  // signal is OK: the server may run
+)
+
 // ActionKind is a concrete effect the executor performs.
 type ActionKind int
 
@@ -175,12 +188,14 @@ type Action struct {
 	Load string
 }
 
-// ReconcileLoad turns a desired state + observed actual state into the actions
-// needed to close the gap. It is idempotent: for a chassis it only commands a
-// change when actual disagrees with desired; for a NUT server it continuously
-// holds the shed signal in the right position (the executor applies that
-// idempotently) and only WoLs while the server is desired-on but still down.
-func ReconcileLoad(name string, lt LoadType, d Desired, actual ActualState) []Action {
+// ReconcileLoad turns a desired state + observed actual/shed state into the
+// actions needed to close the gap. It is edge-triggered: a chassis is commanded
+// only when actual power disagrees with desired, and a NUT server's shed signal
+// is (re)driven only when its observed position disagrees with desired — so a
+// settled load emits nothing, and any action means a real transition. An
+// unreadable shed signal (ShedUnknown) re-drives, erring toward the desired
+// action. WoL fires only while the server is desired-on but still down.
+func ReconcileLoad(name string, lt LoadType, d Desired, actual ActualState, shed ShedState) []Action {
 	switch lt {
 	case Chassis:
 		switch d {
@@ -196,10 +211,19 @@ func ReconcileLoad(name string, lt LoadType, d Desired, actual ActualState) []Ac
 	case NutServer:
 		switch d {
 		case DesiredOff:
-			// Hold the shed signal asserted; the server's own upsmon self-shuts.
-			return []Action{{AssertServerShed, name}}
+			// Assert the shed signal so the server's upsmon self-shuts — unless it
+			// is already asserted. Unknown counts as not-asserted, so a failed read
+			// still errs toward shedding.
+			if shed != ShedAsserted {
+				return []Action{{AssertServerShed, name}}
+			}
 		case DesiredOn:
-			acts := []Action{{ReleaseServerShed, name}}
+			var acts []Action
+			// Release only when the signal isn't already clear, so a healthy steady
+			// state is silent. Unknown re-releases, erring toward letting it run.
+			if shed != ShedReleased {
+				acts = append(acts, Action{ReleaseServerShed, name})
+			}
 			if actual == ActualDown {
 				acts = append(acts, Action{WakeServer, name})
 			}
@@ -224,6 +248,7 @@ func Decide(
 	tel map[string]Telemetry,
 	loads map[string]LoadConfig,
 	actual map[string]ActualState,
+	shed map[string]ShedState,
 ) []Action {
 	src := make(map[string]SourceState, len(upsCfgs))
 	for name, c := range upsCfgs {
@@ -243,7 +268,7 @@ func Decide(
 		for _, u := range lc.GovernedBy {
 			states = append(states, src[u])
 		}
-		out = append(out, ReconcileLoad(name, lc.Type, DesiredForLoad(states), actual[name])...)
+		out = append(out, ReconcileLoad(name, lc.Type, DesiredForLoad(states), actual[name], shed[name])...)
 	}
 	return out
 }
