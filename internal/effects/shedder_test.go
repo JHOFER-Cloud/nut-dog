@@ -3,6 +3,8 @@ package effects
 import (
 	"errors"
 	"testing"
+
+	"github.com/JHOFER-Cloud/nut-dog/internal/control"
 )
 
 func TestNUTShedderSignals(t *testing.T) {
@@ -29,6 +31,26 @@ func TestNUTShedderSignals(t *testing.T) {
 	}
 	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// ParseShedStatus must invert the exact strings Assert/Release write, so the
+// controller reads back the state it drove.
+func TestParseShedStatus(t *testing.T) {
+	tests := []struct {
+		status string
+		want   control.ShedState
+	}{
+		{statusShed, control.ShedAsserted}, // "OB LB FSD"
+		{statusOK, control.ShedReleased},   // "OL"
+		{"OL CHRG", control.ShedReleased},
+		{"", control.ShedUnknown},
+		{"OB DISCHRG", control.ShedUnknown}, // on battery but not forced-shed
+	}
+	for _, tt := range tests {
+		if got := ParseShedStatus(tt.status); got != tt.want {
+			t.Errorf("ParseShedStatus(%q) = %v, want %v", tt.status, got, tt.want)
+		}
 	}
 }
 

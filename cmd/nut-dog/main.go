@@ -84,12 +84,13 @@ func main() {
 
 	prober, targets, shedUps := wireLoads(cfg, racadm, chassisReady, log)
 
+	localOpts := nut.Options{
+		Username: cfg.LocalUpsd.AdminUser,
+		Password: os.Getenv(cfg.LocalUpsd.AdminPasswordEnv),
+	}
 	shedder := effects.NUTShedder{
 		ShedUps: shedUps,
-		Set: effects.LocalVarSetter(localUpsdAddr(cfg), nut.Options{
-			Username: cfg.LocalUpsd.AdminUser,
-			Password: os.Getenv(cfg.LocalUpsd.AdminPasswordEnv),
-		}, ioTimeout),
+		Set:     effects.LocalVarSetter(localUpsdAddr(cfg), localOpts, ioTimeout),
 	}
 
 	// Leave Chassis nil unless the CMC runner is ready, so the executor's nil-guard
@@ -110,6 +111,12 @@ func main() {
 
 	ctrl := app.New(cfg.ControlUPS(), cfg.ControlLoads(), poller, prober, executor, log)
 	ctrl.Verbose = cfg.Verbose // opt-in per-tick telemetry log (debug; real telemetry belongs in metrics)
+	// Read each shed signal back from the local upsd so the reconcile only drives
+	// it on a real transition (edge-triggered), rather than re-asserting every tick.
+	ctrl.ShedReader = shedReader{
+		addr: localUpsdAddr(cfg), opts: localOpts, timeout: ioTimeout,
+		shedUps: shedUps, log: log,
+	}
 
 	preflight(cfg, poller, racadm, chassisReady, prober, log)
 
@@ -303,6 +310,32 @@ func wireLoads(cfg *config.Config, chassis effects.RacadmChassis, chassisReady b
 		}
 	}
 	return probes, targets, shedUps
+}
+
+// --- shed reader ---
+
+// shedReader reads a NUT server's shed signal back from nut-dog's own upsd and
+// classifies it, so the controller can stay edge-triggered. A failed read is
+// ShedUnknown, which makes the reconcile re-drive the signal (safe fallback).
+type shedReader struct {
+	addr    string
+	opts    nut.Options
+	timeout time.Duration
+	shedUps map[string]string // load name -> shed dummy-ups name
+	log     *slog.Logger
+}
+
+func (r shedReader) ReadShed(load string) control.ShedState {
+	ups, ok := r.shedUps[load]
+	if !ok {
+		return control.ShedUnknown
+	}
+	vars, err := nut.Fetch(r.addr, ups, r.opts, r.timeout)
+	if err != nil {
+		r.log.Warn("shed signal read failed", "load", load, "ups", ups, "err", err)
+		return control.ShedUnknown
+	}
+	return effects.ParseShedStatus(vars["ups.status"])
 }
 
 func tcpProbe(addr string) control.ActualState {

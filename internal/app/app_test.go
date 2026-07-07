@@ -16,6 +16,10 @@ type mapProber map[string]control.ActualState
 
 func (m mapProber) Probe(load string) control.ActualState { return m[load] }
 
+type mapShedReader map[string]control.ShedState
+
+func (m mapShedReader) ReadShed(load string) control.ShedState { return m[load] }
+
 type recordApplier struct{ got []control.Action }
 
 func (r *recordApplier) Apply(a []control.Action) { r.got = append(r.got, a...) }
@@ -61,5 +65,31 @@ func TestTickAllHealthyNoActions(t *testing.T) {
 
 	if len(applier.got) != 0 {
 		t.Errorf("expected no actions, got %+v", applier.got)
+	}
+}
+
+// A healthy nut-server whose shed signal is already released must be silent: with
+// a ShedReader wired, the reconcile is edge-triggered and re-drives nothing.
+func TestTickHealthyServerSilentWithShedReader(t *testing.T) {
+	upsCfg := map[string]control.UPSConfig{
+		"ups-a": {ShedRuntime: 300, RecoverCharge: 5},
+		"ups-b": {ShedRuntime: 300, RecoverCharge: 5},
+	}
+	loads := map[string]control.LoadConfig{
+		"p1": {Type: control.NutServer, GovernedBy: []string{"ups-a", "ups-b"}},
+	}
+	poller := mapPoller{
+		"ups-a": {OK: true, Status: control.Status{OnLine: true}, Charge: 100},
+		"ups-b": {OK: true, Status: control.Status{OnLine: true}, Charge: 100},
+	}
+	prober := mapProber{"p1": control.ActualUp}
+	applier := &recordApplier{}
+
+	c := New(upsCfg, loads, poller, prober, applier, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.ShedReader = mapShedReader{"p1": control.ShedReleased}
+	c.Tick()
+
+	if len(applier.got) != 0 {
+		t.Errorf("expected no actions for a settled healthy server, got %+v", applier.got)
 	}
 }

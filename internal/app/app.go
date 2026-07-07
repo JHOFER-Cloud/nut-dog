@@ -24,6 +24,14 @@ type Prober interface {
 	Probe(load string) control.ActualState
 }
 
+// ShedReader reads the current position of a NUT server's shed signal (the
+// ups.status nut-dog serves for it on the local upsd), so the reconcile stays
+// edge-triggered. Optional: when nil, shed state reads as Unknown and the
+// controller falls back to re-driving the signal every tick.
+type ShedReader interface {
+	ReadShed(load string) control.ShedState
+}
+
 // Applier performs the decided actions.
 type Applier interface {
 	Apply(actions []control.Action)
@@ -35,6 +43,7 @@ type Controller struct {
 	Loads      map[string]control.LoadConfig
 	Poller     Poller
 	Prober     Prober
+	ShedReader ShedReader
 	Applier    Applier
 	Log        *slog.Logger
 
@@ -74,8 +83,14 @@ func (c *Controller) Tick() {
 		tel[u] = c.Poller.Poll(u)
 	}
 	actual := make(map[string]control.ActualState, len(c.loadNames))
+	shed := make(map[string]control.ShedState, len(c.loadNames))
 	for _, l := range c.loadNames {
 		actual[l] = c.Prober.Probe(l)
+		// Shed signals exist only for NUT servers; reading it back is what keeps
+		// the reconcile edge-triggered instead of re-driving OL every tick.
+		if c.ShedReader != nil && c.Loads[l].Type == control.NutServer {
+			shed[l] = c.ShedReader.ReadShed(l)
+		}
 	}
 	if c.Verbose {
 		for _, u := range c.upsNames {
@@ -84,10 +99,14 @@ func (c *Controller) Tick() {
 				"status", statusString(t.Status), "runtime_s", t.Runtime, "charge_pct", t.Charge)
 		}
 		for _, l := range c.loadNames {
-			c.Log.Info("load", "name", l, "actual", actualString(actual[l]))
+			if c.Loads[l].Type == control.NutServer {
+				c.Log.Info("load", "name", l, "actual", actualString(actual[l]), "shed", shedString(shed[l]))
+			} else {
+				c.Log.Info("load", "name", l, "actual", actualString(actual[l]))
+			}
 		}
 	}
-	actions := control.Decide(c.UPSConfigs, tel, c.Loads, actual)
+	actions := control.Decide(c.UPSConfigs, tel, c.Loads, actual, shed)
 	if len(actions) > 0 {
 		c.Log.Info("reconcile", "actions", len(actions))
 	}
@@ -117,6 +136,17 @@ func actualString(a control.ActualState) string {
 		return "up"
 	case control.ActualDown:
 		return "down"
+	default:
+		return "unknown"
+	}
+}
+
+func shedString(s control.ShedState) string {
+	switch s {
+	case control.ShedAsserted:
+		return "asserted"
+	case control.ShedReleased:
+		return "released"
 	default:
 		return "unknown"
 	}
