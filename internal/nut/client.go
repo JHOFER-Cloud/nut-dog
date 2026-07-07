@@ -75,6 +75,17 @@ func Fetch(addr, ups string, opts Options, timeout time.Duration) (map[string]st
 	return collectVars(r, ups)
 }
 
+// CheckAuth connects and authenticates (USERNAME/PASSWORD) without issuing any
+// command — a non-destructive preflight that the shed-signal SET credentials
+// and the local upsd are reachable and valid.
+func CheckAuth(addr string, opts Options, timeout time.Duration) error {
+	conn, _, err := connect(addr, opts, timeout)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
 // SetVar sets a variable on a UPS via the NUT SET command. nut-dog uses it to
 // drive a per-server dummy-ups shed signal (ups.status "OB LB" / "OL"), which
 // the server's own upsmon self-shuts on. The authenticated user needs SET

@@ -4,6 +4,7 @@
 # templates. Secret VALUES come from env (k8s secret), referenced by *Env fields.
 pollInterval: 15s
 dryRun: true # first rollout: log intended actions, execute nothing
+verbose: false # debug: log every UPS's telemetry + each load's state each tick (noisy → Loki)
 
 # This pod's own upsd: serves the local drivers + the per-server shed signals.
 localUpsd:

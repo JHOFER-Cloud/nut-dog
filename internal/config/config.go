@@ -35,6 +35,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 type Config struct {
 	PollInterval Duration            `yaml:"pollInterval"`
 	DryRun       bool                `yaml:"dryRun"`
+	Verbose      bool                `yaml:"verbose"` // log telemetry + state each tick (debug; noisy)
 	LocalUpsd    LocalUpsdSpec       `yaml:"localUpsd"`
 	UPSes        map[string]UPSSpec  `yaml:"upses"`
 	Loads        map[string]LoadSpec `yaml:"loads"`

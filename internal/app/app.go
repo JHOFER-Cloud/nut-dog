@@ -8,6 +8,7 @@ package app
 import (
 	"log/slog"
 	"sort"
+	"strings"
 
 	"github.com/JHOFER-Cloud/nut-dog/internal/control"
 )
@@ -36,6 +37,10 @@ type Controller struct {
 	Prober     Prober
 	Applier    Applier
 	Log        *slog.Logger
+
+	// Verbose logs the telemetry + actual state each tick (used in dryRun so
+	// observe-mode is actually observable). Off when armed to keep logs quiet.
+	Verbose bool
 
 	upsNames  []string
 	loadNames []string
@@ -72,9 +77,47 @@ func (c *Controller) Tick() {
 	for _, l := range c.loadNames {
 		actual[l] = c.Prober.Probe(l)
 	}
+	if c.Verbose {
+		for _, u := range c.upsNames {
+			t := tel[u]
+			c.Log.Info("ups", "name", u, "ok", t.OK,
+				"status", statusString(t.Status), "runtime_s", t.Runtime, "charge_pct", t.Charge)
+		}
+		for _, l := range c.loadNames {
+			c.Log.Info("load", "name", l, "actual", actualString(actual[l]))
+		}
+	}
 	actions := control.Decide(c.UPSConfigs, tel, c.Loads, actual)
 	if len(actions) > 0 {
 		c.Log.Info("reconcile", "actions", len(actions))
 	}
 	c.Applier.Apply(actions)
+}
+
+func statusString(s control.Status) string {
+	var parts []string
+	if s.OnLine {
+		parts = append(parts, "OL")
+	}
+	if s.OnBattery {
+		parts = append(parts, "OB")
+	}
+	if s.LowBattery {
+		parts = append(parts, "LB")
+	}
+	if len(parts) == 0 {
+		return "?"
+	}
+	return strings.Join(parts, " ")
+}
+
+func actualString(a control.ActualState) string {
+	switch a {
+	case control.ActualUp:
+		return "up"
+	case control.ActualDown:
+		return "down"
+	default:
+		return "unknown"
+	}
 }
