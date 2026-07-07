@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,22 +59,30 @@ func main() {
 
 	// One RacadmChassis (SSH) shared by the chassis prober and the executor.
 	var racadm effects.RacadmChassis
-	haveChassis := hasChassis(cfg)
-	if haveChassis {
-		key := []byte(os.Getenv("CMC_SSH_KEY"))
+	chassisReady := false
+	if hasChassis(cfg) {
+		// Secret stores mangle multi-line PEMs into literal "\n"; unescape so the
+		// key parses however it was stored.
+		key := []byte(strings.ReplaceAll(os.Getenv("CMC_SSH_KEY"), `\n`, "\n"))
 		hostKey := cmcHostKey(cfg)
 		runner, err := effects.NewSSHRunner(cmcUser(cfg), key, hostKey, ioTimeout)
-		if err != nil {
+		switch {
+		case err != nil && cfg.DryRun:
+			// In observe-only mode, keep running so UPS telemetry is still visible.
+			log.Warn("cmc ssh setup failed; chassis control disabled in dryRun", "err", err)
+		case err != nil:
 			log.Error("cmc ssh setup", "err", err)
 			os.Exit(1)
+		default:
+			if hostKey == "" {
+				log.Warn("cmc host key not pinned; SSH host-key verification disabled (set cmc.hostKey)")
+			}
+			racadm = effects.RacadmChassis{R: runner}
+			chassisReady = true
 		}
-		if hostKey == "" {
-			log.Warn("cmc host key not pinned; SSH host-key verification disabled (set cmc.hostKey)")
-		}
-		racadm = effects.RacadmChassis{R: runner}
 	}
 
-	prober, targets, shedUps := wireLoads(cfg, racadm, log)
+	prober, targets, shedUps := wireLoads(cfg, racadm, chassisReady, log)
 
 	shedder := effects.NUTShedder{
 		ShedUps: shedUps,
@@ -82,10 +92,10 @@ func main() {
 		}, ioTimeout),
 	}
 
-	// Leave Chassis nil when there's no chassis load, so the executor's nil-guard
+	// Leave Chassis nil unless the CMC runner is ready, so the executor's nil-guard
 	// catches a mis-wiring instead of calling into a zero RacadmChassis.
 	var chassisEffect effects.Chassis
-	if haveChassis {
+	if chassisReady {
 		chassisEffect = racadm
 	}
 
@@ -99,6 +109,9 @@ func main() {
 	}
 
 	ctrl := app.New(cfg.ControlUPS(), cfg.ControlLoads(), poller, prober, executor, log)
+	ctrl.Verbose = cfg.Verbose // opt-in per-tick telemetry log (debug; real telemetry belongs in metrics)
+
+	preflight(cfg, poller, racadm, chassisReady, prober, log)
 
 	interval := time.Duration(cfg.PollInterval)
 	log.Info("nut-dog started", "pollInterval", interval.String(), "dryRun", cfg.DryRun)
@@ -118,6 +131,86 @@ func main() {
 			ctrl.Tick()
 		}
 	}
+}
+
+// preflight exercises every external path once at startup and logs a ✓/✗ per
+// endpoint, so a routing/cred/privilege problem surfaces now instead of during
+// an outage. Every check is read-only or a proven no-op (WoL only to an already-
+// up host; upsd auth without a SET). It's informational — failures are logged,
+// not fatal (the reconcile loop fail-safes regardless).
+func preflight(cfg *config.Config, poller nutPoller, racadm effects.RacadmChassis, chassisReady bool, prober funcProber, log *slog.Logger) {
+	log.Info("preflight: exercising all endpoints once")
+	fails := 0
+	report := func(name string, err error) {
+		if err != nil {
+			log.Warn("preflight ✗", "check", name, "err", err)
+			fails++
+		} else {
+			log.Info("preflight ✓", "check", name)
+		}
+	}
+
+	for _, name := range sortedKeys(cfg.UPSes) {
+		if poller.Poll(name).OK {
+			log.Info("preflight ✓", "check", "ups:"+name)
+		} else {
+			log.Warn("preflight ✗", "check", "ups:"+name, "err", "poll returned no data")
+			fails++
+		}
+	}
+
+	// Local upsd admin auth = the shed-signal SET path (creds + reachability),
+	// without touching ups.status.
+	if cfg.LocalUpsd.AdminUser != "" {
+		report("upsd-admin-auth", nut.CheckAuth(localUpsdAddr(cfg), nut.Options{
+			Username: cfg.LocalUpsd.AdminUser,
+			Password: os.Getenv(cfg.LocalUpsd.AdminPasswordEnv),
+		}, ioTimeout))
+	}
+
+	waker := effects.UDPWaker{}
+	for _, name := range sortedKeys(cfg.Loads) {
+		l := cfg.Loads[name]
+		switch l.Type {
+		case config.TypeChassis:
+			if !chassisReady {
+				log.Warn("preflight ✗", "check", "cmc:"+name, "err", "ssh runner not ready")
+				fails++
+				continue
+			}
+			_, err := racadm.PowerState(l.CMC.Host)
+			report("cmc:"+name, err)
+		case config.TypeNutServer:
+			actual := prober.Probe(name)
+			if actual == control.ActualUnknown {
+				log.Warn("preflight ✗", "check", "probe:"+name, "err", "unreachable")
+				fails++
+			} else {
+				log.Info("preflight ✓", "check", "probe:"+name, "state", actual == control.ActualUp)
+			}
+			// WoL only to an up host (no-op); never wake a down host at startup.
+			if actual == control.ActualUp {
+				report("wol:"+name, waker.Wake(l.Wake.MAC, l.Wake.Broadcast))
+			} else {
+				log.Info("preflight — skip", "check", "wol:"+name, "reason", "target not up")
+			}
+		}
+	}
+
+	if fails > 0 {
+		log.Warn("preflight complete with failures", "failures", fails)
+	} else {
+		log.Info("preflight complete: all endpoints reachable")
+	}
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // --- poller ---
@@ -180,7 +273,7 @@ func (p funcProber) Probe(load string) control.ActualState {
 // wireLoads builds the per-load probe functions, executor targets, and shed-ups
 // map from config. Chassis loads probe via getmodinfo over SSH; nut-server loads
 // probe via a TCP reachability check.
-func wireLoads(cfg *config.Config, chassis effects.RacadmChassis, log *slog.Logger) (funcProber, map[string]effects.Target, map[string]string) {
+func wireLoads(cfg *config.Config, chassis effects.RacadmChassis, chassisReady bool, log *slog.Logger) (funcProber, map[string]effects.Target, map[string]string) {
 	probes := make(funcProber, len(cfg.Loads))
 	targets := make(map[string]effects.Target, len(cfg.Loads))
 	shedUps := make(map[string]string)
@@ -190,6 +283,9 @@ func wireLoads(cfg *config.Config, chassis effects.RacadmChassis, log *slog.Logg
 		case config.TypeChassis:
 			host := l.CMC.Host
 			probes[name] = func() control.ActualState {
+				if !chassisReady {
+					return control.ActualUnknown // no CMC runner (e.g. bad key in dryRun)
+				}
 				st, err := chassis.PowerState(host)
 				if err != nil {
 					// Unknown -> the controller won't act on BC1 this tick (it can't
