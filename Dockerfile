@@ -3,11 +3,12 @@
 # dummy-ups), which the entrypoint configures from env and starts before the
 # controller. nut-dog itself speaks NUT/SSH/WoL in Go, so no client tools needed.
 FROM golang:1.26-bookworm AS build
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/nut-dog ./cmd/nut-dog
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/nut-dog ./cmd/nut-dog
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

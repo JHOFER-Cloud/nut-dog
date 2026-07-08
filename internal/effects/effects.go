@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"github.com/JHOFER-Cloud/nut-dog/internal/control"
+	"github.com/JHOFER-Cloud/nut-dog/internal/metrics"
 )
 
 // Chassis commands a blade chassis through its CMC (racadm over SSH).
@@ -45,14 +46,18 @@ type Executor struct {
 	Chassis Chassis
 	Shedder Shedder
 	Waker   Waker
+	Metrics *metrics.Metrics // optional; nil-safe
 	Log     *slog.Logger
 }
 
-// Apply runs every action, logging (never swallowing) any failure so a broken
-// CMC/WoL is visible rather than silent.
+// Apply runs every action, counting it (even in dryRun, so intended actions are
+// visible) and logging (never swallowing) any failure so a broken CMC/WoL is
+// visible rather than silent.
 func (e *Executor) Apply(actions []control.Action) {
 	for _, a := range actions {
-		if err := e.do(a); err != nil {
+		err := e.do(a)
+		e.Metrics.RecordAction(a.Load, a.Kind.String(), err != nil)
+		if err != nil {
 			e.Log.Error("effect failed", "action", a.Kind.String(), "load", a.Load, "err", err)
 		}
 	}
