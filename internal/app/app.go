@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/JHOFER-Cloud/nut-dog/internal/control"
+	"github.com/JHOFER-Cloud/nut-dog/internal/metrics"
 )
 
 // Poller reads one UPS's current telemetry (never errors: a failed read is
@@ -46,6 +47,11 @@ type Controller struct {
 	ShedReader ShedReader
 	Applier    Applier
 	Log        *slog.Logger
+
+	// Metrics records the controller's interpretation (source classification,
+	// per-load desired/actual/shed) and the reconcile heartbeat each tick.
+	// Optional: all recorders are no-ops on a nil *Metrics.
+	Metrics *metrics.Metrics
 
 	// Verbose logs the telemetry + actual state each tick (used in dryRun so
 	// observe-mode is actually observable). Off when armed to keep logs quiet.
@@ -106,11 +112,36 @@ func (c *Controller) Tick() {
 			}
 		}
 	}
+	c.record(tel, actual, shed)
+
 	actions := control.Decide(c.UPSConfigs, tel, c.Loads, actual, shed)
 	if len(actions) > 0 {
 		c.Log.Info("reconcile", "actions", len(actions))
 	}
 	c.Applier.Apply(actions)
+	c.Metrics.ObserveReconcile()
+}
+
+// record publishes the controller's interpretation for this tick: each UPS's
+// classification and each load's desired/actual/shed state. It reuses the same
+// pure functions Decide does, so the metrics can't drift from the decision.
+func (c *Controller) record(tel map[string]control.Telemetry, actual map[string]control.ActualState, shed map[string]control.ShedState) {
+	if c.Metrics == nil {
+		return
+	}
+	src := make(map[string]control.SourceState, len(c.upsNames))
+	for _, u := range c.upsNames {
+		src[u] = control.Classify(c.UPSConfigs[u], tel[u])
+		c.Metrics.RecordSource(u, src[u])
+	}
+	for _, l := range c.loadNames {
+		lc := c.Loads[l]
+		states := make([]control.SourceState, 0, len(lc.GovernedBy))
+		for _, u := range lc.GovernedBy {
+			states = append(states, src[u])
+		}
+		c.Metrics.RecordLoad(l, control.DesiredForLoad(states), actual[l], shed[l], lc.Type == control.NutServer)
+	}
 }
 
 func statusString(s control.Status) string {

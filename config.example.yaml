@@ -5,6 +5,7 @@
 pollInterval: 15s
 dryRun: true # first rollout: log intended actions, execute nothing
 verbose: false # debug: log every UPS's telemetry + each load's state each tick (noisy → Loki)
+metricsListen: ":9334" # /metrics + /healthz (hostNetwork → node IP; distinct from energy-watchdog's :9333)
 
 # This pod's own upsd: serves the local drivers + the per-server shed signals.
 localUpsd:
