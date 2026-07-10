@@ -13,12 +13,12 @@ import (
 func TestRecordPollTelemetryAndStatus(t *testing.T) {
 	m := New("test")
 	m.RecordPoll("ups-a", true, map[string]string{
-		"ups.status":       "OL TEST", // CyberPower during its self-test
-		"battery.charge":   "100",
-		"battery.runtime":  "900",
-		"ups.load":         "34",
-		"output.realpower": "0",            // CyberPower reports watts, not VA
-		"ups.temperature":  "not-a-number", // must be skipped, not error
+		"ups.status":      "OL TEST", // CyberPower during its self-test
+		"battery.charge":  "100",
+		"battery.runtime": "900",
+		"ups.load":        "34",
+		"ups.realpower":   "420",          // CyberPower real power (watts), cyberpower MIB
+		"ups.temperature": "not-a-number", // must be skipped, not error
 	})
 
 	checks := []struct {
@@ -30,7 +30,7 @@ func TestRecordPollTelemetryAndStatus(t *testing.T) {
 		{"charge", testutil.ToFloat64(m.telemetry["battery.charge"].WithLabelValues("ups-a")), 100},
 		{"runtime", testutil.ToFloat64(m.telemetry["battery.runtime"].WithLabelValues("ups-a")), 900},
 		{"load", testutil.ToFloat64(m.telemetry["ups.load"].WithLabelValues("ups-a")), 34},
-		{"realpower", testutil.ToFloat64(m.telemetry["output.realpower"].WithLabelValues("ups-a")), 0},
+		{"realpower", testutil.ToFloat64(m.telemetry["ups.realpower"].WithLabelValues("ups-a")), 420},
 		{"status OL", testutil.ToFloat64(m.upsStatus.WithLabelValues("ups-a", "OL")), 1},
 		{"status TEST", testutil.ToFloat64(m.upsStatus.WithLabelValues("ups-a", "TEST")), 1},
 		{"status OB reset to 0", testutil.ToFloat64(m.upsStatus.WithLabelValues("ups-a", "OB")), 0},
