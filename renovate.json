@@ -4,4 +4,16 @@
   "reviewers": [
     "ojsef39"
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=github-releases depName=networkupstools/nut\\s+ARG NUT_VERSION=(?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "networkupstools/nut",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ]
 }
