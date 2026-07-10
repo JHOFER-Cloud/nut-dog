@@ -61,3 +61,13 @@ and push the multi-arch image to `ghcr.io/jhofer-cloud/nut-dog`.
 Deployed via GitOps from the `fleet` repo (`infra/nut-dog/`), pinned to an
 always-on control-plane Pi, `hostNetwork`, shipping `dryRun: true` until the live
 pull-the-plug drill passes.
+
+## Observability
+
+Serves Prometheus metrics (`nut_dog_*`) and `/healthz` on `:9334`: per-UPS
+telemetry freshness (the fail-safe's key blind spot), the controller's decisions
+(desired/actual/shed per load), action failures, and the full UPS telemetry it
+polls (charge, runtime, load, voltages, temperature). Scrape config and alerts
+live in `fleet` (`infra/nut-dog/common/serviceMonitor.yaml`, `infra/monitoring/.../nut-dog-alerts.yaml`).
+
+Grafana dashboard: [`fleet-dashboards` → `sync/K8s/Misc/nut-dog.json`](https://github.com/JHOFER-Cloud/fleet-dashboards/blob/main/sync/K8s/Misc/nut-dog.json).
