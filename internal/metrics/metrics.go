@@ -29,8 +29,9 @@ import (
 // UniFi expose without per-UPS code. scale converts NUT's unit to the metric's
 // (all 1 today; kept for e.g. milli-units a future UPS might report).
 //
-// Grounded in the live var sets: the CyberPower RMCARD reports output.realpower
-// (watts) but no temperature; the UniFi reports output.power (VA) and
+// Grounded in the live var sets: the CyberPower RMCARD reports real power as
+// ups.realpower (watts) but no temperature, and only under the cyberpower MIB
+// (RFC1628's upsOutputPower stays 0); the UniFi reports output.power (VA) and
 // ups.temperature. Every entry here is reported by at least one of them.
 var telemetrySpecs = []struct {
 	varName, metric, help string
@@ -46,7 +47,7 @@ var telemetrySpecs = []struct {
 	{"output.frequency", "nut_dog_ups_output_frequency_hertz", "Output frequency, hertz.", 1},
 	{"output.current", "nut_dog_ups_output_current_amperes", "Output current, amperes.", 1},
 	{"output.power", "nut_dog_ups_output_power_voltamperes", "Output apparent power, volt-amperes (UniFi).", 1},
-	{"output.realpower", "nut_dog_ups_output_realpower_watts", "Output real power, watts (CyberPower).", 1},
+	{"ups.realpower", "nut_dog_ups_output_realpower_watts", "Output real power, watts (CyberPower, via ups.realpower).", 1},
 	{"ups.load", "nut_dog_ups_load_percent", "UPS load, percent of capacity.", 1},
 	{"ups.temperature", "nut_dog_ups_temperature_celsius", "UPS temperature, celsius (UniFi).", 1},
 }
