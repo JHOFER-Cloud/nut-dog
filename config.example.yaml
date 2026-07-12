@@ -67,6 +67,15 @@ loads:
     wake: { mac: "98:b7:85:20:77:6b", broadcast: "10.1.1.255:9" }
     probe: { host: pve-1.hla1.jhofer.lan:22 } # TCP reachability = up
     secondary: { user: p1, passwordEnv: P1_SECONDARY_PW } # p1's upsmon login
+    # Optional: don't wake p1 while another controller is deliberately holding it
+    # off. energy-watchdog powers p1 down for solar deficit and wakes it itself on
+    # surplus; without this gate nut-dog (seeing healthy UPSes) would keep trying
+    # to WoL it and fight that. The query is an instant PromQL expression; a truthy
+    # result (here: a non-empty vector while "shed" is the active mode) inhibits the
+    # wake. If the query can't be evaluated, the wake is held (fail-closed).
+    wakeInhibit:
+      prometheus: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+      query: 'energy_watchdog_mode{mode="shed"} == 1'
 
   # Adding another server later is JUST this block (+ its secret P2_SECONDARY_PW):
   # p2:

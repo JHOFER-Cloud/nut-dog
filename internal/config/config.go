@@ -77,12 +77,13 @@ type DriverSpec struct {
 
 // LoadSpec is one controllable load.
 type LoadSpec struct {
-	Type       string         `yaml:"type"` // "chassis" | "nut-server"
-	GovernedBy []string       `yaml:"governedBy"`
-	CMC        *CMCSpec       `yaml:"cmc"`       // chassis only
-	Wake       *WakeSpec      `yaml:"wake"`      // nut-server only
-	Probe      *ProbeSpec     `yaml:"probe"`     // nut-server only
-	Secondary  *SecondarySpec `yaml:"secondary"` // nut-server only
+	Type        string           `yaml:"type"` // "chassis" | "nut-server"
+	GovernedBy  []string         `yaml:"governedBy"`
+	CMC         *CMCSpec         `yaml:"cmc"`         // chassis only
+	Wake        *WakeSpec        `yaml:"wake"`        // nut-server only
+	Probe       *ProbeSpec       `yaml:"probe"`       // nut-server only
+	Secondary   *SecondarySpec   `yaml:"secondary"`   // nut-server only
+	WakeInhibit *WakeInhibitSpec `yaml:"wakeInhibit"` // optional: defer power-on to an external authority
 }
 
 type CMCSpec struct {
@@ -107,6 +108,18 @@ type ProbeSpec struct {
 type SecondarySpec struct {
 	User        string `yaml:"user"`
 	PasswordEnv string `yaml:"passwordEnv"`
+}
+
+// WakeInhibitSpec lets an external authority veto powering a load on. Before
+// nut-dog would wake (or power up) the load, it runs Query against Prometheus; a
+// truthy result (a non-empty vector or non-zero scalar) means something else is
+// deliberately holding the load off, so nut-dog defers instead of fighting it.
+// This keeps nut-dog from waking a server that energy-watchdog has powered down
+// for solar deficit. Absent => no gate. If the query can't be evaluated, nut-dog
+// holds the wake (fail-closed) rather than risk fighting the other controller.
+type WakeInhibitSpec struct {
+	Prometheus string `yaml:"prometheus"` // base URL, e.g. http://prometheus.monitoring.svc.cluster.local:9090
+	Query      string `yaml:"query"`      // instant PromQL; a truthy result inhibits the wake
 }
 
 const (
@@ -173,6 +186,9 @@ func (c *Config) validate() error {
 			}
 		default:
 			return fmt.Errorf("load %q: unknown type %q", name, l.Type)
+		}
+		if l.WakeInhibit != nil && (l.WakeInhibit.Prometheus == "" || l.WakeInhibit.Query == "") {
+			return fmt.Errorf("load %q: wakeInhibit needs prometheus and query", name)
 		}
 		if len(l.GovernedBy) == 0 {
 			return fmt.Errorf("load %q: governedBy is empty", name)
