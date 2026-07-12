@@ -86,10 +86,11 @@ type Metrics struct {
 	reconcileTime prometheus.Gauge
 
 	// Actions (executor) + mode.
-	actions     *prometheus.CounterVec
-	actionFails *prometheus.CounterVec
-	dryRun      prometheus.Gauge
-	buildInfo   *prometheus.GaugeVec
+	actions       *prometheus.CounterVec
+	actionFails   *prometheus.CounterVec
+	wakeInhibited *prometheus.CounterVec
+	dryRun        prometheus.Gauge
+	buildInfo     *prometheus.GaugeVec
 }
 
 // New builds and registers every collector on a private registry (plus the Go
@@ -133,6 +134,9 @@ func New(version string) *Metrics {
 	m.actionFails = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nut_dog_action_failures_total", Help: "Actions whose execution failed (armed only).",
 	}, []string{"load", "action"})
+	m.wakeInhibited = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nut_dog_wake_inhibited_total", Help: "Power-on actions suppressed because an external authority is holding the load off.",
+	}, []string{"load"})
 	m.dryRun = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "nut_dog_dry_run", Help: "1 if running in dryRun (observe-only), 0 if armed.",
 	})
@@ -143,7 +147,7 @@ func New(version string) *Metrics {
 	cs := []prometheus.Collector{
 		m.upsReachable, m.upsLastSuccess, m.upsPollFails, m.upsStatus,
 		m.upsSource, m.loadDesired, m.loadActual, m.loadShed, m.reconcileTime,
-		m.actions, m.actionFails, m.dryRun, m.buildInfo,
+		m.actions, m.actionFails, m.wakeInhibited, m.dryRun, m.buildInfo,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	}
@@ -238,6 +242,16 @@ func (m *Metrics) RecordAction(load, action string, failed bool) {
 	if failed {
 		m.actionFails.WithLabelValues(load, action).Inc()
 	}
+}
+
+// RecordWakeInhibited counts one power-on suppressed by an external hold (e.g.
+// energy-watchdog), so a deferral is visible rather than looking like a missed
+// action.
+func (m *Metrics) RecordWakeInhibited(load string) {
+	if m == nil {
+		return
+	}
+	m.wakeInhibited.WithLabelValues(load).Inc()
 }
 
 // setOneHot sets active to 1 and every other state to 0 for one id.

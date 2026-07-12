@@ -38,6 +38,16 @@ type Applier interface {
 	Apply(actions []control.Action)
 }
 
+// WakeInhibitor reports whether an external authority is deliberately holding a
+// load powered off, so nut-dog should defer (skip the power-on) rather than fight
+// it — e.g. energy-watchdog having shed a server for solar deficit. Optional: a
+// nil WakeInhibitor never inhibits, and only loads it knows about are gated.
+type WakeInhibitor interface {
+	// InhibitWake reports whether the named load's power-on should be suppressed
+	// this tick, with a short reason for the log.
+	InhibitWake(load string) (inhibited bool, reason string)
+}
+
 // Controller holds everything one reconcile Tick needs.
 type Controller struct {
 	UPSConfigs map[string]control.UPSConfig
@@ -47,6 +57,10 @@ type Controller struct {
 	ShedReader ShedReader
 	Applier    Applier
 	Log        *slog.Logger
+
+	// WakeInhibitor lets an external authority veto a power-on so nut-dog defers to
+	// it instead of fighting it. Optional: nil never inhibits.
+	WakeInhibitor WakeInhibitor
 
 	// Metrics records the controller's interpretation (source classification,
 	// per-load desired/actual/shed) and the reconcile heartbeat each tick.
@@ -114,12 +128,43 @@ func (c *Controller) Tick() {
 	}
 	c.record(tel, actual, shed)
 
-	actions := control.Decide(c.UPSConfigs, tel, c.Loads, actual, shed)
+	actions := c.gateWakes(control.Decide(c.UPSConfigs, tel, c.Loads, actual, shed))
 	if len(actions) > 0 {
 		c.Log.Info("reconcile", "actions", len(actions))
 	}
 	c.Applier.Apply(actions)
 	c.Metrics.ObserveReconcile()
+}
+
+// gateWakes drops power-on actions for loads an external authority is deliberately
+// holding off (e.g. energy-watchdog powering a server down for solar deficit), so
+// nut-dog defers instead of fighting the other controller. Every other action —
+// including releasing nut-dog's own shed signal — passes through untouched, so
+// the reconcile still converges everything it does own.
+func (c *Controller) gateWakes(actions []control.Action) []control.Action {
+	if c.WakeInhibitor == nil {
+		return actions
+	}
+	// In-place filter: Decide returns a freshly allocated slice each tick, so
+	// reusing its backing array is safe and keeps the no-drop path allocation-free.
+	kept := actions[:0]
+	for _, a := range actions {
+		if isPowerOn(a.Kind) {
+			if inhibited, reason := c.WakeInhibitor.InhibitWake(a.Load); inhibited {
+				c.Log.Info("wake inhibited", "load", a.Load, "action", a.Kind.String(), "reason", reason)
+				c.Metrics.RecordWakeInhibited(a.Load)
+				continue
+			}
+		}
+		kept = append(kept, a)
+	}
+	return kept
+}
+
+// isPowerOn is true for the actions that bring a load up — the ones a wake
+// inhibitor gates.
+func isPowerOn(k control.ActionKind) bool {
+	return k == control.WakeServer || k == control.ChassisPowerUp
 }
 
 // record publishes the controller's interpretation for this tick: each UPS's
