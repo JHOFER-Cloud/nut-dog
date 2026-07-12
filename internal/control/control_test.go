@@ -77,20 +77,26 @@ func TestReconcileLoad(t *testing.T) {
 		lt     LoadType
 		d      Desired
 		actual ActualState
+		shed   ShedState
 		want   []Action
 	}{
-		{"chassis shed when up", Chassis, DesiredOff, ActualUp, []Action{{ChassisShutdown, "L"}}},
-		{"chassis no reshed when down", Chassis, DesiredOff, ActualDown, nil},
-		{"chassis powerup when down", Chassis, DesiredOn, ActualDown, []Action{{ChassisPowerUp, "L"}}},
-		{"chassis no powerup when up", Chassis, DesiredOn, ActualUp, nil},
-		{"chassis hold does nothing", Chassis, DesiredHold, ActualUp, nil},
-		{"server holds shed signal when off", NutServer, DesiredOff, ActualUp, []Action{{AssertServerShed, "L"}}},
-		{"server release + wake when down", NutServer, DesiredOn, ActualDown, []Action{{ReleaseServerShed, "L"}, {WakeServer, "L"}}},
-		{"server release only when up", NutServer, DesiredOn, ActualUp, []Action{{ReleaseServerShed, "L"}}},
-		{"server hold does nothing", NutServer, DesiredHold, ActualDown, nil},
+		{"chassis shed when up", Chassis, DesiredOff, ActualUp, ShedUnknown, []Action{{ChassisShutdown, "L"}}},
+		{"chassis no reshed when down", Chassis, DesiredOff, ActualDown, ShedUnknown, nil},
+		{"chassis powerup when down", Chassis, DesiredOn, ActualDown, ShedUnknown, []Action{{ChassisPowerUp, "L"}}},
+		{"chassis no powerup when up", Chassis, DesiredOn, ActualUp, ShedUnknown, nil},
+		{"chassis hold does nothing", Chassis, DesiredHold, ActualUp, ShedUnknown, nil},
+		// NUT server, edge-triggered on the shed signal's observed position.
+		{"server asserts when released and off", NutServer, DesiredOff, ActualUp, ShedReleased, []Action{{AssertServerShed, "L"}}},
+		{"server no re-assert when already asserted", NutServer, DesiredOff, ActualDown, ShedAsserted, nil},
+		{"server asserts on unknown signal (fail-safe shed)", NutServer, DesiredOff, ActualUp, ShedUnknown, []Action{{AssertServerShed, "L"}}},
+		{"server release + wake when asserted and down", NutServer, DesiredOn, ActualDown, ShedAsserted, []Action{{ReleaseServerShed, "L"}, {WakeServer, "L"}}},
+		{"server release only when asserted and up", NutServer, DesiredOn, ActualUp, ShedAsserted, []Action{{ReleaseServerShed, "L"}}},
+		{"server silent when already released and up", NutServer, DesiredOn, ActualUp, ShedReleased, nil},
+		{"server wakes only when released but still down", NutServer, DesiredOn, ActualDown, ShedReleased, []Action{{WakeServer, "L"}}},
+		{"server hold does nothing", NutServer, DesiredHold, ActualDown, ShedAsserted, nil},
 	}
 	for _, tt := range tests {
-		got := ReconcileLoad("L", tt.lt, tt.d, tt.actual)
+		got := ReconcileLoad("L", tt.lt, tt.d, tt.actual, tt.shed)
 		if !actionsEqual(got, tt.want) {
 			t.Errorf("%s: got %v, want %v", tt.name, got, tt.want)
 		}
@@ -114,48 +120,63 @@ func TestDecideScenarios(t *testing.T) {
 		name   string
 		tel    map[string]Telemetry
 		actual map[string]ActualState
+		shed   map[string]ShedState
 		want   []Action
 	}{
 		{
 			name:   "grid loss: UPS-A critical sheds BC1 + p1",
 			tel:    map[string]Telemetry{"ups-a": onBattery(120, 60), "ups-b": online(95)},
 			actual: map[string]ActualState{"bc1": ActualUp, "p1": ActualUp},
+			shed:   map[string]ShedState{"p1": ShedReleased}, // was healthy -> assert now
 			want:   []Action{{ChassisShutdown, "bc1"}, {AssertServerShed, "p1"}},
 		},
 		{
 			name:   "UPS-B fault sheds p1 only, never BC1",
 			tel:    map[string]Telemetry{"ups-a": online(95), "ups-b": onBatteryLow()},
 			actual: map[string]ActualState{"bc1": ActualUp, "p1": ActualUp},
+			shed:   map[string]ShedState{"p1": ShedReleased},
 			want:   []Action{{AssertServerShed, "p1"}},
 		},
 		{
 			name:   "recovery: both healthy, both down -> power back up",
 			tel:    map[string]Telemetry{"ups-a": online(80), "ups-b": online(90)},
 			actual: map[string]ActualState{"bc1": ActualDown, "p1": ActualDown},
+			shed:   map[string]ShedState{"p1": ShedAsserted}, // was shed -> release + wake
 			want:   []Action{{ChassisPowerUp, "bc1"}, {ReleaseServerShed, "p1"}, {WakeServer, "p1"}},
+		},
+		{
+			name:   "steady state: all healthy, all up, signal released -> nothing",
+			tel:    map[string]Telemetry{"ups-a": online(100), "ups-b": online(100)},
+			actual: map[string]ActualState{"bc1": ActualUp, "p1": ActualUp},
+			shed:   map[string]ShedState{"p1": ShedReleased},
+			want:   nil, // edge-triggered: no re-release of an already-clear signal
 		},
 		{
 			name:   "UPS-A no data: fail safe, do nothing",
 			tel:    map[string]Telemetry{"ups-a": noData(), "ups-b": online(95)},
 			actual: map[string]ActualState{"bc1": ActualUp, "p1": ActualUp},
+			shed:   map[string]ShedState{"p1": ShedReleased},
 			want:   nil,
 		},
 		{
 			name:   "deadband: UPS-A on battery but above floor -> hold",
 			tel:    map[string]Telemetry{"ups-a": onBattery(600, 80), "ups-b": online(95)},
 			actual: map[string]ActualState{"bc1": ActualUp, "p1": ActualUp},
+			shed:   map[string]ShedState{"p1": ShedReleased},
 			want:   nil,
 		},
 		{
-			name:   "p1 stays shed while UPS-B still critical even as UPS-A recovers",
+			name:   "p1 stays shed silently while UPS-B critical even as UPS-A recovers",
 			tel:    map[string]Telemetry{"ups-a": online(80), "ups-b": onBatteryLow()},
 			actual: map[string]ActualState{"bc1": ActualDown, "p1": ActualDown},
-			// BC1 recovers (UPS-A healthy); p1 held down by UPS-B -> shed signal kept asserted.
-			want: []Action{{ChassisPowerUp, "bc1"}, {AssertServerShed, "p1"}},
+			shed:   map[string]ShedState{"p1": ShedAsserted}, // already asserted
+			// BC1 recovers (UPS-A healthy); p1 held down by UPS-B, signal already
+			// asserted -> nothing to re-drive.
+			want: []Action{{ChassisPowerUp, "bc1"}},
 		},
 	}
 	for _, tt := range tests {
-		got := Decide(fixtureCfgs(), tt.tel, fixtureLoads(), tt.actual)
+		got := Decide(fixtureCfgs(), tt.tel, fixtureLoads(), tt.actual, tt.shed)
 		if !actionsEqual(got, tt.want) {
 			t.Errorf("%s:\n  got  %v\n  want %v", tt.name, got, tt.want)
 		}

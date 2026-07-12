@@ -33,6 +33,12 @@ then powers everything back when mains returns. See
   `shed-<name>` dummy-ups critical and its own `upsmon` shuts it down; woken via
   Wake-on-LAN. Adding a server is a config block, nothing else.
 
+A load may set an optional `wakeInhibit` (a Prometheus URL + instant PromQL): when
+the query is truthy, nut-dog skips that load's power-on and defers to whoever is
+holding it off — e.g. energy-watchdog powering p1 down for solar deficit — instead
+of fighting it. It still releases its own shed signal; only the wake is held. If
+the query can't be evaluated, the wake is held (fail-closed).
+
 ## Config
 
 Everything is config-driven — see [`config.example.yaml`](config.example.yaml).
@@ -61,3 +67,13 @@ and push the multi-arch image to `ghcr.io/jhofer-cloud/nut-dog`.
 Deployed via GitOps from the `fleet` repo (`infra/nut-dog/`), pinned to an
 always-on control-plane Pi, `hostNetwork`, shipping `dryRun: true` until the live
 pull-the-plug drill passes.
+
+## Observability
+
+Serves Prometheus metrics (`nut_dog_*`) and `/healthz` on `:9334`: per-UPS
+telemetry freshness (the fail-safe's key blind spot), the controller's decisions
+(desired/actual/shed per load), action failures, and the full UPS telemetry it
+polls (charge, runtime, load, voltages, temperature). Scrape config and alerts
+live in `fleet` (`infra/nut-dog/common/serviceMonitor.yaml`, `infra/monitoring/.../nut-dog-alerts.yaml`).
+
+Grafana dashboard: [`fleet-dashboards` → `sync/K8s/Misc/nut-dog.json`](https://github.com/JHOFER-Cloud/fleet-dashboards/blob/main/sync/K8s/Misc/nut-dog.json).

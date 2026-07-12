@@ -2,8 +2,10 @@ package effects
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/JHOFER-Cloud/nut-dog/internal/control"
 	"github.com/JHOFER-Cloud/nut-dog/internal/nut"
 )
 
@@ -33,6 +35,26 @@ type NUTShedder struct {
 
 func (s NUTShedder) Assert(load string) error  { return s.set(load, statusShed) }
 func (s NUTShedder) Release(load string) error { return s.set(load, statusOK) }
+
+// ParseShedStatus maps a shed dummy-ups's ups.status back to a control.ShedState
+// — the inverse of Assert/Release, so the controller can read the signal it drove
+// and stay edge-triggered. FSD (forced shutdown, part of statusShed) marks the
+// asserted signal; a plain OL marks released; anything else is unknown.
+func ParseShedStatus(status string) control.ShedState {
+	ol := false
+	for f := range strings.FieldsSeq(status) {
+		switch f {
+		case "FSD":
+			return control.ShedAsserted
+		case "OL":
+			ol = true
+		}
+	}
+	if ol {
+		return control.ShedReleased
+	}
+	return control.ShedUnknown
+}
 
 func (s NUTShedder) set(load, status string) error {
 	ups, ok := s.ShedUps[load]

@@ -8,8 +8,10 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -21,11 +23,27 @@ import (
 	"github.com/JHOFER-Cloud/nut-dog/internal/config"
 	"github.com/JHOFER-Cloud/nut-dog/internal/control"
 	"github.com/JHOFER-Cloud/nut-dog/internal/effects"
+	"github.com/JHOFER-Cloud/nut-dog/internal/metrics"
 	"github.com/JHOFER-Cloud/nut-dog/internal/nut"
 	"github.com/JHOFER-Cloud/nut-dog/internal/nutconf"
+	"github.com/JHOFER-Cloud/nut-dog/internal/prom"
 )
 
 const ioTimeout = 5 * time.Second
+
+// wakeInhibitTimeout bounds the Prometheus gate query. It runs inline in the
+// reconcile Tick, so keep it short: a slow/unreachable Prometheus must not stall
+// reconciliation (and thus other loads' actions). On timeout the gate fails
+// closed — a held wake is the safe outcome anyway.
+const wakeInhibitTimeout = 2 * time.Second
+
+// defaultMetricsListen is distinct from energy-watchdog's :9333 so the two can
+// coexist on the same hostNetwork control-plane node.
+const defaultMetricsListen = ":9334"
+
+// version is stamped at build time (-ldflags "-X main.version=..."); build_info
+// carries it.
+var version = "dev"
 
 func main() {
 	cfgPath := flag.String("config", "/config/config.yaml", "path to config file")
@@ -55,7 +73,10 @@ func main() {
 		return
 	}
 
-	poller := newPoller(cfg, log)
+	m := metrics.New(version)
+	m.SetDryRun(cfg.DryRun)
+
+	poller := newPoller(cfg, m, log)
 
 	// One RacadmChassis (SSH) shared by the chassis prober and the executor.
 	var racadm effects.RacadmChassis
@@ -84,12 +105,13 @@ func main() {
 
 	prober, targets, shedUps := wireLoads(cfg, racadm, chassisReady, log)
 
+	localOpts := nut.Options{
+		Username: cfg.LocalUpsd.AdminUser,
+		Password: os.Getenv(cfg.LocalUpsd.AdminPasswordEnv),
+	}
 	shedder := effects.NUTShedder{
 		ShedUps: shedUps,
-		Set: effects.LocalVarSetter(localUpsdAddr(cfg), nut.Options{
-			Username: cfg.LocalUpsd.AdminUser,
-			Password: os.Getenv(cfg.LocalUpsd.AdminPasswordEnv),
-		}, ioTimeout),
+		Set:     effects.LocalVarSetter(localUpsdAddr(cfg), localOpts, ioTimeout),
 	}
 
 	// Leave Chassis nil unless the CMC runner is ready, so the executor's nil-guard
@@ -105,11 +127,24 @@ func main() {
 		Chassis: chassisEffect,
 		Shedder: shedder,
 		Waker:   effects.UDPWaker{},
+		Metrics: m,
 		Log:     log,
 	}
 
 	ctrl := app.New(cfg.ControlUPS(), cfg.ControlLoads(), poller, prober, executor, log)
+	ctrl.Metrics = m
 	ctrl.Verbose = cfg.Verbose // opt-in per-tick telemetry log (debug; real telemetry belongs in metrics)
+	// Optional: defer a load's power-on to an external authority (energy-watchdog)
+	// when its wakeInhibit query says the load is being deliberately held off.
+	if inhibitor := wireWakeInhibitor(cfg, log); inhibitor != nil {
+		ctrl.WakeInhibitor = inhibitor
+	}
+	// Read each shed signal back from the local upsd so the reconcile only drives
+	// it on a real transition (edge-triggered), rather than re-asserting every tick.
+	ctrl.ShedReader = shedReader{
+		addr: localUpsdAddr(cfg), opts: localOpts, timeout: ioTimeout,
+		shedUps: shedUps, log: log,
+	}
 
 	preflight(cfg, poller, racadm, chassisReady, prober, log)
 
@@ -118,6 +153,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	srv := startMetricsServer(metricsListen(cfg), m, log)
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -126,11 +164,42 @@ func main() {
 		select {
 		case <-ctx.Done():
 			log.Info("shutting down")
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), ioTimeout)
+			_ = srv.Shutdown(shutdownCtx)
+			cancel()
 			return
 		case <-ticker.C:
 			ctrl.Tick()
 		}
 	}
+}
+
+// startMetricsServer serves /metrics and /healthz in the background and returns
+// the server so the run loop can shut it down. A listen failure is logged, not
+// fatal — losing observability must not take down the controller.
+func startMetricsServer(addr string, m *metrics.Metrics, log *slog.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", m.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: ioTimeout}
+	go func() {
+		log.Info("metrics listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("metrics server", "err", err)
+		}
+	}()
+	return srv
+}
+
+// metricsListen resolves the metrics listen address, defaulting when unset.
+func metricsListen(cfg *config.Config) string {
+	if cfg.MetricsListen == "" {
+		return defaultMetricsListen
+	}
+	return cfg.MetricsListen
 }
 
 // preflight exercises every external path once at startup and logs a ✓/✗ per
@@ -171,6 +240,12 @@ func preflight(cfg *config.Config, poller nutPoller, racadm effects.RacadmChassi
 	waker := effects.UDPWaker{}
 	for _, name := range sortedKeys(cfg.Loads) {
 		l := cfg.Loads[name]
+		// Exercise the wake-inhibit query once so a bad URL/query surfaces now, not
+		// silently as a fail-closed hold during a wake.
+		if l.WakeInhibit != nil {
+			_, err := prom.NewClient(l.WakeInhibit.Prometheus, wakeInhibitTimeout).Truthy(l.WakeInhibit.Query)
+			report("wake-inhibit:"+name, err)
+		}
 		switch l.Type {
 		case config.TypeChassis:
 			if !chassisReady {
@@ -224,11 +299,14 @@ type upsPoll struct {
 type nutPoller struct {
 	specs   map[string]upsPoll
 	timeout time.Duration
+	metrics *metrics.Metrics
 	log     *slog.Logger
 }
 
 // Poll never errors: a failed read returns zero Telemetry (OK=false), which the
-// controller treats as Unknown and fail-safes on.
+// controller treats as Unknown and fail-safes on. It also records the raw UPS
+// telemetry + freshness as a side effect, since this is where the full var map
+// lives.
 func (p nutPoller) Poll(ups string) control.Telemetry {
 	spec, ok := p.specs[ups]
 	if !ok {
@@ -237,12 +315,14 @@ func (p nutPoller) Poll(ups string) control.Telemetry {
 	vars, err := nut.Fetch(spec.addr, spec.ups, spec.opts, p.timeout)
 	if err != nil {
 		p.log.Warn("ups poll failed", "ups", ups, "err", err)
+		p.metrics.RecordPoll(ups, false, nil)
 		return control.Telemetry{}
 	}
+	p.metrics.RecordPoll(ups, true, vars)
 	return nut.TelemetryFromVars(vars)
 }
 
-func newPoller(cfg *config.Config, log *slog.Logger) nutPoller {
+func newPoller(cfg *config.Config, m *metrics.Metrics, log *slog.Logger) nutPoller {
 	specs := make(map[string]upsPoll, len(cfg.UPSes))
 	for name, u := range cfg.UPSes {
 		specs[name] = upsPoll{
@@ -256,7 +336,7 @@ func newPoller(cfg *config.Config, log *slog.Logger) nutPoller {
 			},
 		}
 	}
-	return nutPoller{specs: specs, timeout: ioTimeout, log: log}
+	return nutPoller{specs: specs, timeout: ioTimeout, metrics: m, log: log}
 }
 
 // --- prober ---
@@ -303,6 +383,85 @@ func wireLoads(cfg *config.Config, chassis effects.RacadmChassis, chassisReady b
 		}
 	}
 	return probes, targets, shedUps
+}
+
+// --- wake inhibitor ---
+
+// promCheck is one load's Prometheus wake gate.
+type promCheck struct {
+	client *prom.Client
+	query  string
+}
+
+// wakeInhibitor implements app.WakeInhibitor by running each gated load's
+// Prometheus query. A truthy result (or a query error) holds the wake.
+type wakeInhibitor struct {
+	checks map[string]promCheck
+	log    *slog.Logger
+}
+
+// InhibitWake holds a load's power-on when its gate query is truthy. On a query
+// error it holds too (fail-closed): if nut-dog can't confirm the external
+// authority has released the load, it defers rather than risk fighting it.
+func (w wakeInhibitor) InhibitWake(load string) (bool, string) {
+	c, ok := w.checks[load]
+	if !ok {
+		return false, ""
+	}
+	truthy, err := c.client.Truthy(c.query)
+	if err != nil {
+		w.log.Warn("wake-inhibit query failed; holding wake (fail-closed)", "load", load, "err", err)
+		return true, "inhibit query failed (fail-closed)"
+	}
+	if truthy {
+		return true, "external hold active"
+	}
+	return false, ""
+}
+
+// wireWakeInhibitor builds the per-load wake gate from config. Returns nil when no
+// load has a wakeInhibit block, so the controller keeps its default (never gate).
+func wireWakeInhibitor(cfg *config.Config, log *slog.Logger) app.WakeInhibitor {
+	checks := make(map[string]promCheck)
+	for name, l := range cfg.Loads {
+		if l.WakeInhibit == nil {
+			continue
+		}
+		checks[name] = promCheck{
+			client: prom.NewClient(l.WakeInhibit.Prometheus, wakeInhibitTimeout),
+			query:  l.WakeInhibit.Query,
+		}
+	}
+	if len(checks) == 0 {
+		return nil
+	}
+	return wakeInhibitor{checks: checks, log: log}
+}
+
+// --- shed reader ---
+
+// shedReader reads a NUT server's shed signal back from nut-dog's own upsd and
+// classifies it, so the controller can stay edge-triggered. A failed read is
+// ShedUnknown, which makes the reconcile re-drive the signal (safe fallback).
+type shedReader struct {
+	addr    string
+	opts    nut.Options
+	timeout time.Duration
+	shedUps map[string]string // load name -> shed dummy-ups name
+	log     *slog.Logger
+}
+
+func (r shedReader) ReadShed(load string) control.ShedState {
+	ups, ok := r.shedUps[load]
+	if !ok {
+		return control.ShedUnknown
+	}
+	vars, err := nut.Fetch(r.addr, ups, r.opts, r.timeout)
+	if err != nil {
+		r.log.Warn("shed signal read failed", "load", load, "ups", ups, "err", err)
+		return control.ShedUnknown
+	}
+	return effects.ParseShedStatus(vars["ups.status"])
 }
 
 func tcpProbe(addr string) control.ActualState {
