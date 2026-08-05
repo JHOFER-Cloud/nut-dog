@@ -24,32 +24,40 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// telemetrySpecs maps a NUT variable to a dedicated gauge. Each is emitted only
-// when the UPS actually reports it, so the set adapts to what CyberPower vs
+// telemetrySpecs maps NUT variables to a dedicated gauge. Each is emitted only
+// while the UPS actually reports it, so the set adapts to what CyberPower vs
 // UniFi expose without per-UPS code. scale converts NUT's unit to the metric's
 // (all 1 today; kept for e.g. milli-units a future UPS might report).
 //
+// varNames are tried in order, first present wins: a 2026-08 UniFi firmware
+// swapped output.power (VA at nominal V) for ups.power (VA at measured V).
+//
 // Grounded in the live var sets: the CyberPower RMCARD reports real power as
 // ups.realpower (watts) but no temperature, and only under the cyberpower MIB
-// (RFC1628's upsOutputPower stays 0); the UniFi reports output.power (VA) and
+// (RFC1628's upsOutputPower stays 0); the UniFi reports apparent power and
 // ups.temperature. Every entry here is reported by at least one of them.
+//
+// UniFi's ups.realpower is ups.load (integer percent) x ups.realpower.nominal,
+// not a measurement: 10 W steps, and it read 100.0 W where the UI showed 80.00 W.
+// output.powerfactor is realpower/power, same error, so it is not exported.
 var telemetrySpecs = []struct {
-	varName, metric, help string
-	scale                 float64
+	varNames     []string
+	metric, help string
+	scale        float64
 }{
-	{"battery.charge", "nut_dog_ups_battery_charge_percent", "Battery charge, percent.", 1},
-	{"battery.runtime", "nut_dog_ups_battery_runtime_seconds", "Estimated battery runtime, seconds.", 1},
-	{"battery.voltage", "nut_dog_ups_battery_voltage_volts", "Battery voltage, volts.", 1},
-	{"input.voltage", "nut_dog_ups_input_voltage_volts", "Input (mains) voltage, volts.", 1},
-	{"input.frequency", "nut_dog_ups_input_frequency_hertz", "Input frequency, hertz.", 1},
-	{"input.current", "nut_dog_ups_input_current_amperes", "Input current, amperes.", 1},
-	{"output.voltage", "nut_dog_ups_output_voltage_volts", "Output voltage, volts.", 1},
-	{"output.frequency", "nut_dog_ups_output_frequency_hertz", "Output frequency, hertz.", 1},
-	{"output.current", "nut_dog_ups_output_current_amperes", "Output current, amperes.", 1},
-	{"output.power", "nut_dog_ups_output_power_voltamperes", "Output apparent power, volt-amperes (UniFi).", 1},
-	{"ups.realpower", "nut_dog_ups_output_realpower_watts", "Output real power, watts (CyberPower, via ups.realpower).", 1},
-	{"ups.load", "nut_dog_ups_load_percent", "UPS load, percent of capacity.", 1},
-	{"ups.temperature", "nut_dog_ups_temperature_celsius", "UPS temperature, celsius (UniFi).", 1},
+	{[]string{"battery.charge"}, "nut_dog_ups_battery_charge_percent", "Battery charge, percent.", 1},
+	{[]string{"battery.runtime"}, "nut_dog_ups_battery_runtime_seconds", "Estimated battery runtime, seconds.", 1},
+	{[]string{"battery.voltage"}, "nut_dog_ups_battery_voltage_volts", "Battery voltage, volts.", 1},
+	{[]string{"input.voltage"}, "nut_dog_ups_input_voltage_volts", "Input (mains) voltage, volts.", 1},
+	{[]string{"input.frequency"}, "nut_dog_ups_input_frequency_hertz", "Input frequency, hertz.", 1},
+	{[]string{"input.current"}, "nut_dog_ups_input_current_amperes", "Input current, amperes.", 1},
+	{[]string{"output.voltage"}, "nut_dog_ups_output_voltage_volts", "Output voltage, volts.", 1},
+	{[]string{"output.frequency"}, "nut_dog_ups_output_frequency_hertz", "Output frequency, hertz.", 1},
+	{[]string{"output.current"}, "nut_dog_ups_output_current_amperes", "Output current, amperes.", 1},
+	{[]string{"ups.power", "output.power"}, "nut_dog_ups_output_power_voltamperes", "Output apparent power, volt-amperes.", 1},
+	{[]string{"ups.realpower"}, "nut_dog_ups_output_realpower_watts", "Output real power, watts.", 1},
+	{[]string{"ups.load"}, "nut_dog_ups_load_percent", "UPS load, percent of capacity.", 1},
+	{[]string{"ups.temperature"}, "nut_dog_ups_temperature_celsius", "UPS temperature, celsius.", 1},
 }
 
 // statusFlags is the curated ups.status token set we surface as 0/1. Fixed (not
@@ -153,7 +161,9 @@ func New(version string) *Metrics {
 	}
 	for _, spec := range telemetrySpecs {
 		g := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: spec.metric, Help: spec.help}, []string{"ups"})
-		m.telemetry[spec.varName] = g
+		for _, v := range spec.varNames {
+			m.telemetry[v] = g // aliases share one gauge
+		}
 		cs = append(cs, g)
 	}
 	m.reg.MustRegister(cs...)
@@ -175,9 +185,10 @@ func (m *Metrics) SetDryRun(dry bool) {
 	m.dryRun.Set(b2f(dry))
 }
 
-// RecordPoll records one UPS poll. On failure it updates only reachability and
-// the failure counter, leaving the last-known telemetry (and last_success)
-// untouched — reachable=0 + a stale timestamp is the signal, not fake zeros.
+// RecordPoll records one UPS poll. Failed poll: keep last-known telemetry,
+// since reachable=0 + a stale last_success is the signal, not fake zeros.
+// Succeeded but var absent: drop the series — an unwritten gauge keeps serving
+// its last value against a fresh scrape timestamp, indistinguishable from live.
 func (m *Metrics) RecordPoll(ups string, ok bool, vars map[string]string) {
 	if m == nil {
 		return
@@ -194,14 +205,28 @@ func (m *Metrics) RecordPoll(ups string, ok bool, vars map[string]string) {
 		m.upsStatus.WithLabelValues(ups, flag).Set(b2f(present[flag]))
 	}
 	for _, spec := range telemetrySpecs {
-		raw, has := vars[spec.varName]
+		g := m.telemetry[spec.varNames[0]]
+		if v, ok := firstFloat(vars, spec.varNames); ok {
+			g.WithLabelValues(ups).Set(v * spec.scale)
+		} else {
+			g.DeleteLabelValues(ups)
+		}
+	}
+}
+
+// firstFloat returns the first present, parseable var; a malformed one falls
+// through to the next alias. No usable value means the caller drops the series.
+func firstFloat(vars map[string]string, names []string) (float64, bool) {
+	for _, n := range names {
+		raw, has := vars[n]
 		if !has {
 			continue
 		}
 		if v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil {
-			m.telemetry[spec.varName].WithLabelValues(ups).Set(v * spec.scale)
+			return v, true
 		}
 	}
+	return 0, false
 }
 
 // RecordSource records the controller's classification of a UPS.
