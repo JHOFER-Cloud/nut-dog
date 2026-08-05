@@ -60,6 +60,38 @@ func TestRecordPollFailureKeepsTelemetry(t *testing.T) {
 	}
 }
 
+// A var that disappears from a *successful* poll must drop its series, not
+// freeze at the last value: the 2026-08 UniFi firmware retired output.power.
+func TestRecordPollDropsVanishedVar(t *testing.T) {
+	m := New("test")
+	va := m.telemetry["ups.power"]
+
+	m.RecordPoll("ups-b", true, map[string]string{"ups.status": "OL", "output.power": "138"})
+	if got := testutil.ToFloat64(va.WithLabelValues("ups-b")); got != 138 {
+		t.Fatalf("VA = %v, want 138", got)
+	}
+
+	m.RecordPoll("ups-b", true, map[string]string{"ups.status": "OL"})
+	if got := testutil.CollectAndCount(va); got != 0 {
+		t.Errorf("VA series count = %v, want 0 (var gone, series dropped)", got)
+	}
+}
+
+// output.power and ups.power feed one gauge; the newer name wins when both are
+// present, so a firmware that reports both does not flip-flop the series.
+func TestRecordPollVarNameAliases(t *testing.T) {
+	m := New("test")
+	va := m.telemetry["ups.power"]
+
+	if m.telemetry["output.power"] != va {
+		t.Fatal("output.power and ups.power must share one gauge")
+	}
+	m.RecordPoll("ups-b", true, map[string]string{"ups.power": "135.4", "output.power": "138"})
+	if got := testutil.ToFloat64(va.WithLabelValues("ups-b")); got != 135.4 {
+		t.Errorf("VA = %v, want 135.4 (ups.power preferred)", got)
+	}
+}
+
 // One-hot gauges must flip cleanly: setting a new state zeroes the old one.
 func TestOneHotResets(t *testing.T) {
 	m := New("test")
