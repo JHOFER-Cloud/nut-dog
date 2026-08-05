@@ -21,7 +21,12 @@ mkdir -p /run/nut "$CONF"
 ADMINPW="$(openssl rand -hex 16)"
 
 cleanup() {
-	[ -n "$DOG_PID" ] && kill "$DOG_PID" 2>/dev/null || true
+	# Reap nut-dog before upsd: SIGTERM is async, so its in-flight poll would
+	# otherwise race the dying server and log spurious connection-refused errors.
+	if [ -n "$DOG_PID" ]; then
+		kill "$DOG_PID" 2>/dev/null || true
+		wait "$DOG_PID" 2>/dev/null || true
+	fi
 	upsd -c stop 2>/dev/null || true
 	upsdrvctl -u root stop 2>/dev/null || true
 	rm -rf "$WORK"
