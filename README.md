@@ -86,8 +86,9 @@ go build ./cmd/nut-dog        # the controller
 go build ./cmd/nut-probe      # dump a UPS's telemetry (validate a NUT/SNMP UPS)
 
 # integration tests (need nut-server + nut-client, run as root):
-sudo ./test/integration/shed_test.sh        # shed signal shuts a upsmon secondary
-sudo ./test/integration/controller_e2e.sh   # real controller sheds/recovers multiple servers
+sudo ./test/integration/shed_test.sh          # shed signal shuts a upsmon secondary
+sudo ./test/integration/shed_failover_test.sh # ...and still does with a second, unreachable server
+sudo ./test/integration/controller_e2e.sh     # real controller sheds/recovers multiple servers
 ```
 
 Formatted with `gofumpt`. CI (`.github/workflows/ci.yaml`) runs the unit +
