@@ -26,16 +26,10 @@ import (
 	"github.com/JHOFER-Cloud/nut-dog/internal/metrics"
 	"github.com/JHOFER-Cloud/nut-dog/internal/nut"
 	"github.com/JHOFER-Cloud/nut-dog/internal/nutconf"
-	"github.com/JHOFER-Cloud/nut-dog/internal/prom"
+	"github.com/JHOFER-Cloud/nut-dog/internal/powerapi"
 )
 
 const ioTimeout = 5 * time.Second
-
-// wakeInhibitTimeout bounds the Prometheus gate query. It runs inline in the
-// reconcile Tick, so keep it short: a slow/unreachable Prometheus must not stall
-// reconciliation (and thus other loads' actions). On timeout the gate fails
-// closed — a held wake is the safe outcome anyway.
-const wakeInhibitTimeout = 2 * time.Second
 
 // defaultMetricsListen is distinct from energy-watchdog's :9333 so the two can
 // coexist on the same hostNetwork control-plane node.
@@ -134,11 +128,7 @@ func main() {
 	ctrl := app.New(cfg.ControlUPS(), cfg.ControlLoads(), poller, prober, executor, log)
 	ctrl.Metrics = m
 	ctrl.Verbose = cfg.Verbose // opt-in per-tick telemetry log (debug; real telemetry belongs in metrics)
-	// Optional: defer a load's power-on to an external authority (energy-watchdog)
-	// when its wakeInhibit query says the load is being deliberately held off.
-	if inhibitor := wireWakeInhibitor(cfg, log); inhibitor != nil {
-		ctrl.WakeInhibitor = inhibitor
-	}
+	ctrl.StartupGrace = time.Duration(*cfg.StartupGrace)
 	// Read each shed signal back from the local upsd so the reconcile only drives
 	// it on a real transition (edge-triggered), rather than re-asserting every tick.
 	ctrl.ShedReader = shedReader{
@@ -156,10 +146,27 @@ func main() {
 
 	srv := startMetricsServer(metricsListen(cfg), m, log)
 
+	// Optional: let energy-watchdog request power states. Its requests never
+	// outrank a UPS event - control.DesiredForLoad resolves that.
+	var powerSrv *http.Server
+	if cfg.PowerAPI != nil {
+		token := os.Getenv(cfg.PowerAPI.TokenEnv)
+		if token == "" {
+			// Continuing would silently drop back to powering loads autonomously,
+			// against the other controller's intent, with its PUTs refused.
+			log.Error("powerAPI token env is empty", "env", cfg.PowerAPI.TokenEnv)
+			os.Exit(1)
+		}
+		api := powerapi.New(token, cfg.PowerAPI.Loads, time.Duration(*cfg.PowerAPI.RequestTTL), log)
+		ctrl.Requests = api
+		powerSrv = startPowerAPI(cfg.PowerAPI.Listen, api, log)
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	ctrl.Tick() // reconcile immediately, don't wait a full interval
+	ctrl.StartClock() // grace runs from here, not from New: preflight above blocks
+	ctrl.Tick()       // reconcile immediately, don't wait a full interval
 	for {
 		select {
 		case <-ctx.Done():
@@ -167,6 +174,11 @@ func main() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), ioTimeout)
 			_ = srv.Shutdown(shutdownCtx)
 			cancel()
+			if powerSrv != nil {
+				powerCtx, powerCancel := context.WithTimeout(context.Background(), ioTimeout)
+				_ = powerSrv.Shutdown(powerCtx)
+				powerCancel()
+			}
 			return
 		case <-ticker.C:
 			ctrl.Tick()
@@ -189,6 +201,20 @@ func startMetricsServer(addr string, m *metrics.Metrics, log *slog.Logger) *http
 		log.Info("metrics listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("metrics server", "err", err)
+		}
+	}()
+	return srv
+}
+
+// startPowerAPI serves the power-request endpoint on its own listener. Like the
+// metrics server, a failure here is logged rather than fatal: nut-dog must keep
+// reconciling its UPSes even if energy-watchdog can no longer reach it.
+func startPowerAPI(addr string, api *powerapi.Server, log *slog.Logger) *http.Server {
+	srv := &http.Server{Addr: addr, Handler: api.Handler(), ReadHeaderTimeout: ioTimeout}
+	go func() {
+		log.Info("power API listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("power API server", "err", err)
 		}
 	}()
 	return srv
@@ -240,12 +266,6 @@ func preflight(cfg *config.Config, poller nutPoller, racadm effects.RacadmChassi
 	waker := effects.UDPWaker{}
 	for _, name := range sortedKeys(cfg.Loads) {
 		l := cfg.Loads[name]
-		// Exercise the wake-inhibit query once so a bad URL/query surfaces now, not
-		// silently as a fail-closed hold during a wake.
-		if l.WakeInhibit != nil {
-			_, err := prom.NewClient(l.WakeInhibit.Prometheus, wakeInhibitTimeout).Truthy(l.WakeInhibit.Query)
-			report("wake-inhibit:"+name, err)
-		}
 		switch l.Type {
 		case config.TypeChassis:
 			if !chassisReady {
@@ -383,59 +403,6 @@ func wireLoads(cfg *config.Config, chassis effects.RacadmChassis, chassisReady b
 		}
 	}
 	return probes, targets, shedUps
-}
-
-// --- wake inhibitor ---
-
-// promCheck is one load's Prometheus wake gate.
-type promCheck struct {
-	client *prom.Client
-	query  string
-}
-
-// wakeInhibitor implements app.WakeInhibitor by running each gated load's
-// Prometheus query. A truthy result (or a query error) holds the wake.
-type wakeInhibitor struct {
-	checks map[string]promCheck
-	log    *slog.Logger
-}
-
-// InhibitWake holds a load's power-on when its gate query is truthy. On a query
-// error it holds too (fail-closed): if nut-dog can't confirm the external
-// authority has released the load, it defers rather than risk fighting it.
-func (w wakeInhibitor) InhibitWake(load string) (bool, string) {
-	c, ok := w.checks[load]
-	if !ok {
-		return false, ""
-	}
-	truthy, err := c.client.Truthy(c.query)
-	if err != nil {
-		w.log.Warn("wake-inhibit query failed; holding wake (fail-closed)", "load", load, "err", err)
-		return true, "inhibit query failed (fail-closed)"
-	}
-	if truthy {
-		return true, "external hold active"
-	}
-	return false, ""
-}
-
-// wireWakeInhibitor builds the per-load wake gate from config. Returns nil when no
-// load has a wakeInhibit block, so the controller keeps its default (never gate).
-func wireWakeInhibitor(cfg *config.Config, log *slog.Logger) app.WakeInhibitor {
-	checks := make(map[string]promCheck)
-	for name, l := range cfg.Loads {
-		if l.WakeInhibit == nil {
-			continue
-		}
-		checks[name] = promCheck{
-			client: prom.NewClient(l.WakeInhibit.Prometheus, wakeInhibitTimeout),
-			query:  l.WakeInhibit.Query,
-		}
-	}
-	if len(checks) == 0 {
-		return nil
-	}
-	return wakeInhibitor{checks: checks, log: log}
 }
 
 // --- shed reader ---

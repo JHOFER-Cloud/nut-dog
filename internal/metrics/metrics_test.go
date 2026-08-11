@@ -120,19 +120,10 @@ func TestRecordActionCountsFailures(t *testing.T) {
 	}
 }
 
-func TestRecordWakeInhibited(t *testing.T) {
-	m := New("test")
-	m.RecordWakeInhibited("p1")
-	m.RecordWakeInhibited("p1")
-	if got := testutil.ToFloat64(m.wakeInhibited.WithLabelValues("p1")); got != 2 {
-		t.Errorf("wake_inhibited = %v, want 2", got)
-	}
-}
-
 // A chassis load has no shed signal; RecordLoad must not create that series.
 func TestRecordLoadChassisSkipsShed(t *testing.T) {
 	m := New("test")
-	m.RecordLoad("bc1", control.DesiredOn, control.ActualUp, control.ShedUnknown, false)
+	m.RecordLoad("bc1", control.DesiredOn, control.NoRequest, control.ActualUp, control.ShedUnknown, false)
 	if got := testutil.CollectAndCount(m.loadShed); got != 0 {
 		t.Errorf("shed series for chassis = %d, want 0", got)
 	}
@@ -146,7 +137,7 @@ func TestRecordLoadChassisSkipsShed(t *testing.T) {
 func TestHandlerExposesSeries(t *testing.T) {
 	m := New("1.2.3")
 	m.RecordPoll("ups-a", true, map[string]string{"ups.status": "OL", "battery.charge": "100"})
-	m.RecordLoad("p1", control.DesiredOn, control.ActualUp, control.ShedReleased, true)
+	m.RecordLoad("p1", control.DesiredOn, control.NoRequest, control.ActualUp, control.ShedReleased, true)
 
 	rec := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -172,8 +163,7 @@ func TestNilMetricsNoop(t *testing.T) {
 	m.SetDryRun(true)
 	m.RecordPoll("x", true, map[string]string{"ups.status": "OL"})
 	m.RecordSource("x", control.SourceHealthy)
-	m.RecordLoad("x", control.DesiredOn, control.ActualUp, control.ShedReleased, true)
+	m.RecordLoad("x", control.DesiredOn, control.NoRequest, control.ActualUp, control.ShedReleased, true)
 	m.RecordAction("x", "WakeServer", false)
-	m.RecordWakeInhibited("x")
 	m.ObserveReconcile()
 }

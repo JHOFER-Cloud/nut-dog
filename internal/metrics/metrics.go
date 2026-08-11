@@ -71,6 +71,7 @@ var statusFlags = []string{"OL", "OB", "LB", "RB", "CHRG", "DISCHRG", "BYPASS", 
 var (
 	sourceStates  = []string{"unknown", "shed", "hold", "healthy"}
 	desiredStates = []string{"hold", "off", "on"}
+	requestStates = []string{"none", "hold", "off", "on"}
 	actualStates  = []string{"unknown", "up", "down"}
 	shedStates    = []string{"unknown", "released", "asserted"}
 )
@@ -89,16 +90,17 @@ type Metrics struct {
 	// Interpretation (controller).
 	upsSource     *prometheus.GaugeVec
 	loadDesired   *prometheus.GaugeVec
+	loadRequested *prometheus.GaugeVec
+	graceActive   prometheus.Gauge
 	loadActual    *prometheus.GaugeVec
 	loadShed      *prometheus.GaugeVec
 	reconcileTime prometheus.Gauge
 
 	// Actions (executor) + mode.
-	actions       *prometheus.CounterVec
-	actionFails   *prometheus.CounterVec
-	wakeInhibited *prometheus.CounterVec
-	dryRun        prometheus.Gauge
-	buildInfo     *prometheus.GaugeVec
+	actions     *prometheus.CounterVec
+	actionFails *prometheus.CounterVec
+	dryRun      prometheus.Gauge
+	buildInfo   *prometheus.GaugeVec
 }
 
 // New builds and registers every collector on a private registry (plus the Go
@@ -124,6 +126,12 @@ func New(version string) *Metrics {
 	m.upsSource = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nut_dog_ups_source_state", Help: "nut-dog's classification of the UPS (one-hot).",
 	}, []string{"ups", "state"})
+	m.loadRequested = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nut_dog_load_requested_state", Help: "What an external controller asked for, one-hot (none = nobody asked).",
+	}, []string{"load", "state"})
+	m.graceActive = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nut_dog_startup_grace_active", Help: "1 while power-on actions are held after start.",
+	})
 	m.loadDesired = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nut_dog_load_desired_state", Help: "Desired power state per load (one-hot).",
 	}, []string{"load", "state"})
@@ -142,9 +150,6 @@ func New(version string) *Metrics {
 	m.actionFails = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nut_dog_action_failures_total", Help: "Actions whose execution failed (armed only).",
 	}, []string{"load", "action"})
-	m.wakeInhibited = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "nut_dog_wake_inhibited_total", Help: "Power-on actions suppressed because an external authority is holding the load off.",
-	}, []string{"load"})
 	m.dryRun = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "nut_dog_dry_run", Help: "1 if running in dryRun (observe-only), 0 if armed.",
 	})
@@ -154,8 +159,8 @@ func New(version string) *Metrics {
 
 	cs := []prometheus.Collector{
 		m.upsReachable, m.upsLastSuccess, m.upsPollFails, m.upsStatus,
-		m.upsSource, m.loadDesired, m.loadActual, m.loadShed, m.reconcileTime,
-		m.actions, m.actionFails, m.wakeInhibited, m.dryRun, m.buildInfo,
+		m.upsSource, m.loadDesired, m.loadRequested, m.graceActive, m.loadActual, m.loadShed, m.reconcileTime,
+		m.actions, m.actionFails, m.dryRun, m.buildInfo,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	}
@@ -239,15 +244,32 @@ func (m *Metrics) RecordSource(ups string, s control.SourceState) {
 
 // RecordLoad records the per-load decision inputs. The shed signal is only
 // meaningful for NUT servers; for a chassis it is left unset.
-func (m *Metrics) RecordLoad(load string, d control.Desired, a control.ActualState, sh control.ShedState, nutServer bool) {
+func (m *Metrics) RecordLoad(load string, d control.Desired, requested control.Request, a control.ActualState, sh control.ShedState, nutServer bool) {
 	if m == nil {
 		return
 	}
 	setOneHot(m.loadDesired, load, desiredStates, desiredString(d))
+	// Separate from loadDesired so a dashboard can tell "the UPS is holding this
+	// down" from "the other controller is".
+	setOneHot(m.loadRequested, load, requestStates, requested.String())
 	setOneHot(m.loadActual, load, actualStates, actualString(a))
 	if nutServer {
 		setOneHot(m.loadShed, load, shedStates, shedString(sh))
 	}
+}
+
+// RecordStartupGrace publishes whether power-on actions are currently held. Without
+// it, every restart shows desired=on against a load deliberately kept down, and any
+// desired-vs-actual alert fires on each rollout.
+func (m *Metrics) RecordStartupGrace(active bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if active {
+		v = 1
+	}
+	m.graceActive.Set(v)
 }
 
 // ObserveReconcile stamps the completion of a reconcile tick (loop heartbeat).
@@ -267,16 +289,6 @@ func (m *Metrics) RecordAction(load, action string, failed bool) {
 	if failed {
 		m.actionFails.WithLabelValues(load, action).Inc()
 	}
-}
-
-// RecordWakeInhibited counts one power-on suppressed by an external hold (e.g.
-// energy-watchdog), so a deferral is visible rather than looking like a missed
-// action.
-func (m *Metrics) RecordWakeInhibited(load string) {
-	if m == nil {
-		return
-	}
-	m.wakeInhibited.WithLabelValues(load).Inc()
 }
 
 // setOneHot sets active to 1 and every other state to 0 for one id.

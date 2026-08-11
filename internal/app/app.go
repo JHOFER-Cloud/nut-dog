@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/JHOFER-Cloud/nut-dog/internal/control"
 	"github.com/JHOFER-Cloud/nut-dog/internal/metrics"
@@ -38,14 +39,10 @@ type Applier interface {
 	Apply(actions []control.Action)
 }
 
-// WakeInhibitor reports whether an external authority is deliberately holding a
-// load powered off, so nut-dog should defer (skip the power-on) rather than fight
-// it — e.g. energy-watchdog having shed a server for solar deficit. Optional: a
-// nil WakeInhibitor never inhibits, and only loads it knows about are gated.
-type WakeInhibitor interface {
-	// InhibitWake reports whether the named load's power-on should be suppressed
-	// this tick, with a short reason for the log.
-	InhibitWake(load string) (inhibited bool, reason string)
+// PowerRequests reports what an external controller (energy-watchdog) currently
+// wants each load's power state to be. Absent loads mean no request.
+type PowerRequests interface {
+	Desired() map[string]control.Request
 }
 
 // Controller holds everything one reconcile Tick needs.
@@ -58,9 +55,18 @@ type Controller struct {
 	Applier    Applier
 	Log        *slog.Logger
 
-	// WakeInhibitor lets an external authority veto a power-on so nut-dog defers to
-	// it instead of fighting it. Optional: nil never inhibits.
-	WakeInhibitor WakeInhibitor
+	// Requests is the external controller's wanted power state per load. Optional:
+	// nil means every load follows its UPSes alone.
+	Requests PowerRequests
+
+	// StartupGrace suppresses power-on actions for this long after StartClock, so a
+	// restart doesn't wake a load the external controller wants off before its
+	// first request has arrived. Shed actions are never suppressed. 0 disables.
+	StartupGrace time.Duration
+	// Now is the clock, for tests. nil means time.Now.
+	Now func() time.Time
+
+	startedAt time.Time
 
 	// Metrics records the controller's interpretation (source classification,
 	// per-load desired/actual/shed) and the reconcile heartbeat each tick.
@@ -96,6 +102,18 @@ func New(
 	return c
 }
 
+// StartClock starts the startup grace. Call it when the loop actually begins:
+// anything blocking in between (preflight probes over SSH and the network) would
+// otherwise burn the budget the grace exists to provide.
+func (c *Controller) StartClock() { c.startedAt = c.now()() }
+
+func (c *Controller) now() func() time.Time {
+	if c.Now != nil {
+		return c.Now
+	}
+	return time.Now
+}
+
 // Tick runs one reconcile pass.
 func (c *Controller) Tick() {
 	tel := make(map[string]control.Telemetry, len(c.upsNames))
@@ -126,9 +144,10 @@ func (c *Controller) Tick() {
 			}
 		}
 	}
-	c.record(tel, actual, shed)
+	ext := c.requested()
+	c.record(tel, actual, shed, ext)
 
-	actions := c.gateWakes(control.Decide(c.UPSConfigs, tel, c.Loads, actual, shed))
+	actions := c.holdStartupWakes(control.Decide(c.UPSConfigs, tel, c.Loads, actual, shed, ext))
 	if len(actions) > 0 {
 		c.Log.Info("reconcile", "actions", len(actions))
 	}
@@ -136,41 +155,50 @@ func (c *Controller) Tick() {
 	c.Metrics.ObserveReconcile()
 }
 
-// gateWakes drops power-on actions for loads an external authority is deliberately
-// holding off (e.g. energy-watchdog powering a server down for solar deficit), so
-// nut-dog defers instead of fighting the other controller. Every other action —
-// including releasing nut-dog's own shed signal — passes through untouched, so
-// the reconcile still converges everything it does own.
-func (c *Controller) gateWakes(actions []control.Action) []control.Action {
-	if c.WakeInhibitor == nil {
+// holdStartupWakes drops power-on actions during the startup grace. An external
+// controller's request arrives on its own schedule, so acting on "no request"
+// straight after a restart can wake a load it wants off, just to shed it again.
+// Sheds always pass: a restart must never delay an emergency.
+func (c *Controller) holdStartupWakes(actions []control.Action) []control.Action {
+	if c.StartupGrace <= 0 {
 		return actions
 	}
-	// In-place filter: Decide returns a freshly allocated slice each tick, so
-	// reusing its backing array is safe and keeps the no-drop path allocation-free.
+	now := c.now()
+	if c.startedAt.IsZero() {
+		c.startedAt = now()
+	}
+	if now().Sub(c.startedAt) >= c.StartupGrace {
+		c.Metrics.RecordStartupGrace(false)
+		return actions
+	}
+	c.Metrics.RecordStartupGrace(true)
 	kept := actions[:0]
 	for _, a := range actions {
 		if isPowerOn(a.Kind) {
-			if inhibited, reason := c.WakeInhibitor.InhibitWake(a.Load); inhibited {
-				c.Log.Info("wake inhibited", "load", a.Load, "action", a.Kind.String(), "reason", reason)
-				c.Metrics.RecordWakeInhibited(a.Load)
-				continue
-			}
+			c.Log.Info("power-on held during startup grace", "load", a.Load, "action", a.Kind.String())
+			continue
 		}
 		kept = append(kept, a)
 	}
 	return kept
 }
 
-// isPowerOn is true for the actions that bring a load up — the ones a wake
-// inhibitor gates.
+// isPowerOn is true for the actions that bring a load up.
 func isPowerOn(k control.ActionKind) bool {
 	return k == control.WakeServer || k == control.ChassisPowerUp
+}
+
+func (c *Controller) requested() map[string]control.Request {
+	if c.Requests == nil {
+		return nil
+	}
+	return c.Requests.Desired()
 }
 
 // record publishes the controller's interpretation for this tick: each UPS's
 // classification and each load's desired/actual/shed state. It reuses the same
 // pure functions Decide does, so the metrics can't drift from the decision.
-func (c *Controller) record(tel map[string]control.Telemetry, actual map[string]control.ActualState, shed map[string]control.ShedState) {
+func (c *Controller) record(tel map[string]control.Telemetry, actual map[string]control.ActualState, shed map[string]control.ShedState, ext map[string]control.Request) {
 	if c.Metrics == nil {
 		return
 	}
@@ -185,7 +213,7 @@ func (c *Controller) record(tel map[string]control.Telemetry, actual map[string]
 		for _, u := range lc.GovernedBy {
 			states = append(states, src[u])
 		}
-		c.Metrics.RecordLoad(l, control.DesiredForLoad(states), actual[l], shed[l], lc.Type == control.NutServer)
+		c.Metrics.RecordLoad(l, control.DesiredForLoad(states, ext[l]), ext[l], actual[l], shed[l], lc.Type == control.NutServer)
 	}
 }
 

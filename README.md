@@ -33,11 +33,43 @@ then powers everything back when mains returns. See
   `shed-<name>` dummy-ups critical and its own `upsmon` shuts it down; woken via
   Wake-on-LAN. Adding a server is a config block, nothing else.
 
-A load may set an optional `wakeInhibit` (a Prometheus URL + instant PromQL): when
-the query is truthy, nut-dog skips that load's power-on and defers to whoever is
-holding it off — e.g. energy-watchdog powering p1 down for solar deficit — instead
-of fighting it. It still releases its own shed signal; only the wake is held. If
-the query can't be evaluated, the wake is held (fail-closed).
+### Sharing a load with another controller
+
+energy-watchdog decides when p1 should be off for solar reasons, but nut-dog owns
+the power itself: it is the service that has to work during an outage, and its
+mechanisms (the shed signal, WoL) need neither Proxmox nor the cluster.
+
+So energy-watchdog asks, over `powerAPI`:
+
+```
+PUT /api/loads/p1/power   {"desired": "on" | "off" | "hold", "reason": "..."}
+Authorization: Bearer <token>
+```
+
+A request never outranks a UPS event. `DesiredForLoad` resolves it: a critical
+source sheds the load regardless of who wants it on; below that, `off` is honoured
+in any state, and `on` only once every source is healthy — that rule is the whole
+wake interlock, and it needs no coordination with the caller.
+
+`hold` is a request in its own right, not a withdrawal: it pins the load where it is,
+which is what stops nut-dog powering it back on by itself while the caller is
+mid-operation. That is deliberately different from *no* request at all, which hands the
+load back to the UPS verdict — and a healthy UPS means on. There is no way to return a
+load to "no request" by hand; `requestTTL` (default 10h) does it on its own once nobody
+has restated, and restarting nut-dog clears everything, since it keeps none of this.
+
+Expiry is not a neutral state: it hands the load back to its UPSes, and healthy UPSes mean
+*on*. So a caller that dies eventually gets its load powered up rather than pinned where it
+left it — deliberate, since a stranded load is the harder failure to notice. energy-watchdog
+restates every tick even when it has lost Prometheus, so only a genuinely dead one trips it.
+
+Requests live in memory only. Callers restate their wish every tick, so nothing
+has to survive a restart and no stale file can hold a load down. `startupGrace`
+covers the window after a restart where nut-dog hasn't been told yet: for that long
+it takes no power-*on* action. Sheds are never held — a restart must never delay an
+emergency.
+
+`powerAPI.loads` is an allowlist. The token is authority over those loads only.
 
 ## Config
 
