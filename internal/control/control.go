@@ -95,11 +95,60 @@ const (
 	DesiredOn                  // load should be running
 )
 
-// DesiredForLoad combines the states of a load's governing UPSes. A single
-// critical source sheds it; if no source is shedding but any is unknown we hold
-// (fail safe — never shed on missing data, never recover into uncertainty); it
-// runs only when every source is healthy.
-func DesiredForLoad(states []SourceState) Desired {
+// Request is what an external controller (energy-watchdog) asked for. The zero
+// value is "nobody asked", which is deliberately distinct from RequestHold: no
+// request hands the load back to the UPS verdict, which powers it on when every
+// source is healthy, while RequestHold means leave it exactly where it is.
+type Request int
+
+const (
+	NoRequest   Request = iota // nobody asked; the UPSes decide alone
+	RequestHold                // don't move this load in either direction
+	RequestOff
+	RequestOn
+)
+
+func (r Request) String() string {
+	switch r {
+	case RequestHold:
+		return "hold"
+	case RequestOff:
+		return "off"
+	case RequestOn:
+		return "on"
+	default:
+		return "none"
+	}
+}
+
+// DesiredForLoad combines the load's governing UPSes with an external request. The
+// UPS always outranks it: critical sheds regardless. Below that, off is honoured in
+// any state, and on only once every source is healthy — that rule is the wake
+// interlock.
+func DesiredForLoad(states []SourceState, req Request) Desired {
+	d := desiredFromSources(states)
+	if d == DesiredOff {
+		return DesiredOff // UPS critical: nothing overrides this
+	}
+	switch req {
+	case RequestOff:
+		return DesiredOff
+	case RequestOn:
+		if d == DesiredOn {
+			return DesiredOn
+		}
+		return DesiredHold // asked for, but the UPSes aren't all healthy yet
+	case RequestHold:
+		return DesiredHold // the caller is mid-operation: take no power action
+	default:
+		return d
+	}
+}
+
+// desiredFromSources is the UPS-only verdict: any critical sheds, any unknown
+// holds (never shed on missing data, never recover into uncertainty), all
+// healthy runs.
+func desiredFromSources(states []SourceState) Desired {
 	anyShed, anyUnknown, allHealthy := false, false, true
 	for _, s := range states {
 		if s != SourceHealthy {
@@ -249,6 +298,7 @@ func Decide(
 	loads map[string]LoadConfig,
 	actual map[string]ActualState,
 	shed map[string]ShedState,
+	ext map[string]Request, // external power requests, by load; absent = none
 ) []Action {
 	src := make(map[string]SourceState, len(upsCfgs))
 	for name, c := range upsCfgs {
@@ -268,7 +318,8 @@ func Decide(
 		for _, u := range lc.GovernedBy {
 			states = append(states, src[u])
 		}
-		out = append(out, ReconcileLoad(name, lc.Type, DesiredForLoad(states), actual[name], shed[name])...)
+		d := DesiredForLoad(states, ext[name])
+		out = append(out, ReconcileLoad(name, lc.Type, d, actual[name], shed[name])...)
 	}
 	return out
 }

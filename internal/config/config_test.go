@@ -43,7 +43,6 @@ loads:
     wake:  { mac: "98:b7:85:20:77:6b", broadcast: "10.1.1.255:9" }
     probe: { host: pve-1.hla1.jhofer.lan:22 }
     secondary: { user: p1, passwordEnv: P1_SECONDARY_PW }
-    wakeInhibit: { prometheus: "http://prom:9090", query: 'energy_watchdog_mode{mode="shed"} == 1' }
 `
 
 func writeConfig(t *testing.T, body string) string {
@@ -85,9 +84,6 @@ func TestLoadValid(t *testing.T) {
 	if loads["p1"].Type != control.NutServer || len(loads["p1"].GovernedBy) != 2 {
 		t.Errorf("p1 load wrong: %+v", loads["p1"])
 	}
-	if wi := c.Loads["p1"].WakeInhibit; wi == nil || wi.Query == "" || wi.Prometheus == "" {
-		t.Errorf("p1 wakeInhibit not parsed: %+v", c.Loads["p1"].WakeInhibit)
-	}
 }
 
 func TestValidationErrors(t *testing.T) {
@@ -117,9 +113,20 @@ func TestValidationErrors(t *testing.T) {
 				"loads:\n  p1: {type: nut-server, governedBy: [ups-a], probe: {host: h:22}}\n",
 		},
 		{
-			"wakeInhibit without query",
-			"pollInterval: 15s\nupses:\n  ups-a: {host: h:1, upsName: a, shedRuntime: 5m}\n" +
-				"loads:\n  bc1: {type: chassis, governedBy: [ups-a], cmc: {host: c}, wakeInhibit: {prometheus: http://p:9090}}\n",
+			"powerAPI granting authority over a load that doesn't exist",
+			"pollInterval: 15s\npowerAPI: {listen: \":9335\", tokenEnv: T, loads: [nope]}\n" +
+				"upses:\n  ups-a: {host: h:1, upsName: a, shedRuntime: 5m}\n" +
+				"loads:\n  bc1: {type: chassis, governedBy: [ups-a], cmc: {host: c}}\n",
+		},
+		{
+			"negative startupGrace",
+			"pollInterval: 15s\nstartupGrace: -5s\nupses:\n  ups-a: {host: h:1, upsName: a, shedRuntime: 5m}\n" +
+				"loads:\n  bc1: {type: chassis, governedBy: [ups-a], cmc: {host: c}}\n",
+		},
+		{
+			"powerAPI without a token env",
+			"pollInterval: 15s\npowerAPI: {listen: \":9335\"}\nupses:\n  ups-a: {host: h:1, upsName: a, shedRuntime: 5m}\n" +
+				"loads:\n  bc1: {type: chassis, governedBy: [ups-a], cmc: {host: c}}\n",
 		},
 	}
 	for _, tt := range tests {

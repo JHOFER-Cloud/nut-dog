@@ -33,13 +33,35 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 
 // Config is the whole file.
 type Config struct {
-	PollInterval  Duration            `yaml:"pollInterval"`
+	PollInterval Duration `yaml:"pollInterval"`
+	// StartupGrace holds power-on actions for this long after start, so a restart
+	// can't wake a load an external controller wants off before its first request
+	// lands. Sheds are never held. Unset defaults to 180s - three of energy-watchdog's
+	// 60s ticks, so one skipped restate (a failed observe) still lands inside it. Set
+	// 0s to disable.
+	StartupGrace  *Duration           `yaml:"startupGrace"`
 	DryRun        bool                `yaml:"dryRun"`
 	Verbose       bool                `yaml:"verbose"`       // log telemetry + state each tick (debug; noisy)
 	MetricsListen string              `yaml:"metricsListen"` // host:port for /metrics + /healthz ("" -> default)
+	PowerAPI      *PowerAPISpec       `yaml:"powerAPI"`      // optional: let another controller request power states
 	LocalUpsd     LocalUpsdSpec       `yaml:"localUpsd"`
 	UPSes         map[string]UPSSpec  `yaml:"upses"`
 	Loads         map[string]LoadSpec `yaml:"loads"`
+}
+
+// PowerAPISpec configures the endpoint energy-watchdog uses to request a load's
+// power state. It is served on its own listener, separate from metrics, and needs
+// a bearer token: a caller here can shut a host down.
+type PowerAPISpec struct {
+	Listen   string `yaml:"listen"`   // host:port
+	TokenEnv string `yaml:"tokenEnv"` // env var holding the bearer token
+	// Loads the caller may control. Empty means none: the token is not authority
+	// over every load nut-dog happens to manage.
+	Loads []string `yaml:"loads"`
+	// RequestTTL drops a request nobody has restated for this long, so a caller that
+	// dies cannot pin a load forever. Expiry hands the load back to its UPSes, which
+	// on healthy sources means powering it on. Unset defaults to 10h; 0s never expires.
+	RequestTTL *Duration `yaml:"requestTTL"`
 }
 
 // LocalUpsdSpec configures this pod's own upsd — the NUT server that serves the
@@ -77,13 +99,12 @@ type DriverSpec struct {
 
 // LoadSpec is one controllable load.
 type LoadSpec struct {
-	Type        string           `yaml:"type"` // "chassis" | "nut-server"
-	GovernedBy  []string         `yaml:"governedBy"`
-	CMC         *CMCSpec         `yaml:"cmc"`         // chassis only
-	Wake        *WakeSpec        `yaml:"wake"`        // nut-server only
-	Probe       *ProbeSpec       `yaml:"probe"`       // nut-server only
-	Secondary   *SecondarySpec   `yaml:"secondary"`   // nut-server only
-	WakeInhibit *WakeInhibitSpec `yaml:"wakeInhibit"` // optional: defer power-on to an external authority
+	Type       string         `yaml:"type"` // "chassis" | "nut-server"
+	GovernedBy []string       `yaml:"governedBy"`
+	CMC        *CMCSpec       `yaml:"cmc"`       // chassis only
+	Wake       *WakeSpec      `yaml:"wake"`      // nut-server only
+	Probe      *ProbeSpec     `yaml:"probe"`     // nut-server only
+	Secondary  *SecondarySpec `yaml:"secondary"` // nut-server only
 }
 
 type CMCSpec struct {
@@ -110,18 +131,6 @@ type SecondarySpec struct {
 	PasswordEnv string `yaml:"passwordEnv"`
 }
 
-// WakeInhibitSpec lets an external authority veto powering a load on. Before
-// nut-dog would wake (or power up) the load, it runs Query against Prometheus; a
-// truthy result (a non-empty vector or non-zero scalar) means something else is
-// deliberately holding the load off, so nut-dog defers instead of fighting it.
-// This keeps nut-dog from waking a server that energy-watchdog has powered down
-// for solar deficit. Absent => no gate. If the query can't be evaluated, nut-dog
-// holds the wake (fail-closed) rather than risk fighting the other controller.
-type WakeInhibitSpec struct {
-	Prometheus string `yaml:"prometheus"` // base URL, e.g. http://prometheus.monitoring.svc.cluster.local:9090
-	Query      string `yaml:"query"`      // instant PromQL; a truthy result inhibits the wake
-}
-
 const (
 	TypeChassis   = "chassis"
 	TypeNutServer = "nut-server"
@@ -141,6 +150,14 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	if c.PowerAPI != nil && c.PowerAPI.RequestTTL == nil {
+		d := Duration(10 * time.Hour)
+		c.PowerAPI.RequestTTL = &d
+	}
+	if c.StartupGrace == nil {
+		d := Duration(180 * time.Second)
+		c.StartupGrace = &d
+	}
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -153,6 +170,22 @@ func (c *Config) validate() error {
 	}
 	if len(c.UPSes) == 0 {
 		return fmt.Errorf("no upses configured")
+	}
+	if time.Duration(*c.StartupGrace) < 0 {
+		return fmt.Errorf("startupGrace must not be negative")
+	}
+	if c.PowerAPI != nil {
+		if c.PowerAPI.Listen == "" || c.PowerAPI.TokenEnv == "" {
+			return fmt.Errorf("powerAPI needs listen and tokenEnv")
+		}
+		if time.Duration(*c.PowerAPI.RequestTTL) < 0 {
+			return fmt.Errorf("powerAPI.requestTTL must not be negative")
+		}
+		for _, l := range c.PowerAPI.Loads {
+			if _, ok := c.Loads[l]; !ok {
+				return fmt.Errorf("powerAPI.loads references unknown load %q", l)
+			}
+		}
 	}
 	for name, u := range c.UPSes {
 		if u.Host == "" || u.UPSName == "" {
@@ -186,9 +219,6 @@ func (c *Config) validate() error {
 			}
 		default:
 			return fmt.Errorf("load %q: unknown type %q", name, l.Type)
-		}
-		if l.WakeInhibit != nil && (l.WakeInhibit.Prometheus == "" || l.WakeInhibit.Query == "") {
-			return fmt.Errorf("load %q: wakeInhibit needs prometheus and query", name)
 		}
 		if len(l.GovernedBy) == 0 {
 			return fmt.Errorf("load %q: governedBy is empty", name)
