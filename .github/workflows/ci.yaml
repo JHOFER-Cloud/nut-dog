@@ -37,6 +37,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nut-server nut-client
       - name: shed-signal test (single secondary)
         run: sudo --preserve-env=PATH ./test/integration/shed_test.sh
+      - name: shed-signal test (two servers, one unreachable)
+        run: sudo --preserve-env=PATH ./test/integration/shed_failover_test.sh
       - name: controller end-to-end (multi-server)
         run: sudo --preserve-env=PATH,HOME ./test/integration/controller_e2e.sh
 
