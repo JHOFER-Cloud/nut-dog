@@ -123,9 +123,8 @@ func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorised checks the bearer token. The scheme is matched case-insensitively, as RFC 7235
-// requires. The comparison is constant-time in the token's
-// content; its length still leaks, which is not worth defending for a shared secret. The
-// scheme is matched case-sensitively: the only client is energy-watchdog.
+// requires. The comparison is constant-time in the token's content; its length still leaks,
+// which is not worth defending for a shared secret.
 func (s *Server) authorised(r *http.Request) bool {
 	scheme, got, ok := strings.Cut(r.Header.Get("Authorization"), " ")
 	if !ok || !strings.EqualFold(scheme, "bearer") {
