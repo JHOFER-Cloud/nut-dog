@@ -51,6 +51,15 @@ source sheds the load regardless of who wants it on; below that, `off` is honour
 in any state, and `on` only once every source is healthy — that rule is the whole
 wake interlock, and it needs no coordination with the caller.
 
+A request is a level, not an event: nut-dog reads the latest one each poll and the ones in
+between never happened. A shed is the exception, because losing one is not symmetric with
+losing a wake — it stops every guest and then leaves the load running. So an `off` is always
+in force for one poll before anything supersedes it; a request arriving in that window is
+accepted (still `204`) and takes over on the next poll. Since a server's shutdown cannot be
+recalled once its upsmon has seen the signal, what supersedes the shed only decides what
+happens after: `on` costs a shutdown-and-WoL cycle, `hold` leaves it down with the shed
+signal still asserted.
+
 `hold` is a request in its own right, not a withdrawal: it pins the load where it is,
 which is what stops nut-dog powering it back on by itself while the caller is
 mid-operation. That is deliberately different from *no* request at all, which hands the

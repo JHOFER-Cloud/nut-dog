@@ -100,6 +100,9 @@ type staticRequests map[string]control.Request
 
 func (s staticRequests) Desired() map[string]control.Request { return s }
 
+// Applied is a no-op here: a fixed set has no shed hold to advance.
+func (s staticRequests) Applied() {}
+
 func graceFixture(t *testing.T, actual control.ActualState) (*Controller, *recordApplier) {
 	t.Helper()
 	upsCfg := map[string]control.UPSConfig{"ups-a": {ShedRuntime: 300, RecoverCharge: 5}}
