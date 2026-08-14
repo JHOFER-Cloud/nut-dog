@@ -42,12 +42,7 @@ type Applier interface {
 // PowerRequests reports what an external controller (energy-watchdog) currently
 // wants each load's power state to be. Absent loads mean no request.
 type PowerRequests interface {
-	// Desired is a plain read: calling it twice changes nothing.
 	Desired() map[string]control.Request
-	// Applied says this reconcile acted on what Desired returned. A shed stays in force
-	// until one reconcile has been through it, so this must be called once per Tick, after
-	// the actions are applied - never from a probe or a second read.
-	Applied()
 }
 
 // Controller holds everything one reconcile Tick needs.
@@ -157,11 +152,6 @@ func (c *Controller) Tick() {
 		c.Log.Info("reconcile", "actions", len(actions))
 	}
 	c.Applier.Apply(actions)
-	// After the actions, so a shed is only ever marked applied once this pass has had its
-	// chance to drive it.
-	if c.Requests != nil {
-		c.Requests.Applied()
-	}
 	c.Metrics.ObserveReconcile()
 }
 
