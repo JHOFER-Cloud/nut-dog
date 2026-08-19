@@ -30,10 +30,10 @@ type entry struct {
 	at  time.Time
 }
 
-// observation is the last power state the reconcile loop probed for a load, and when. It is
-// served so another controller can ask nut-dog what it actually sees rather than inferring a
-// load's power from something that can fail for its own reasons - a Proxmox node partitioned
-// from its cluster reads as offline there while the host itself is up and serving.
+// observation is the last probed power state for a load and when it was taken. Served so an
+// external controller can read nut-dog's direct view instead of inferring power from a source
+// with its own failure modes - Proxmox reports a node partitioned from its cluster as offline
+// whether or not the host is running.
 type observation struct {
 	state control.ActualState
 	at    time.Time
@@ -68,8 +68,8 @@ func New(token string, loads []string, ttl time.Duration, log *slog.Logger) *Ser
 }
 
 // PublishActual records one reconcile tick's probe results, implementing app.ActualSink.
-// Nothing here expires: the age is served alongside the state and the caller decides what is
-// too old, which beats this end silently turning a stale reading into "unknown".
+// Entries do not expire: the age is served alongside the state so the caller applies its own
+// freshness bound rather than this end silently downgrading a stale reading to unknown.
 func (s *Server) PublishActual(actual map[string]control.ActualState, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,8 +107,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 // handleState serves the load's last probed power state. ageSeconds is computed here rather
-// than shipping a timestamp, so the caller needs no agreement with our clock to judge whether
-// the reading is fresh enough to act on.
+// than shipping a timestamp, so freshness does not depend on the caller's clock agreeing with
+// ours.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if !s.authorised(r) {
 		s.log.Warn("state request rejected: bad token", "remote", r.RemoteAddr)
@@ -129,8 +129,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		AgeSeconds int    `json:"ageSeconds"`
 	}{Actual: control.ActualUnknown.String()}
 	if ok {
-		// A tick has run: report what it saw. Before that the zero value stands, which is
-		// "unknown" - the answer that commits the caller to nothing.
+		// Before the first tick the zero value stands, which is unknown - no opinion.
 		body.Actual = o.state.String()
 		body.AgeSeconds = int(s.now().Sub(o.at).Seconds())
 	}

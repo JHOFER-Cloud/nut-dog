@@ -279,9 +279,8 @@ func preflight(cfg *config.Config, poller nutPoller, racadm effects.RacadmChassi
 			report("cmc:"+name, err)
 		case config.TypeNutServer:
 			actual := prober.Probe(name)
-			// Unknown used to be unreachable here, because the probe only ever answered up or
-			// down. It now also means the host refused the connection - which proves it is
-			// reachable and only its service is down, the opposite of what this used to report.
+			// Unknown was unreachable before tcpProbe distinguished refusals, so this branch
+			// was dead. It now means the host answered with an RST: reachable, service down.
 			if actual == control.ActualUnknown {
 				log.Warn("preflight ✗", "check", "probe:"+name,
 					"err", "refused the connection: reachable, but nothing listening on the probe port")
@@ -437,17 +436,16 @@ func (r shedReader) ReadShed(load string) control.ShedState {
 	return effects.ParseShedStatus(vars["ups.status"])
 }
 
-// tcpProbe reports a load's power state by dialling it. Down means nothing answered at all;
-// a refusal is the opposite of that - something sent us an RST, so the host's network stack is
-// alive and only the service behind the port is gone. Calling that "down" would be a lie the
-// rest of the system now leans on: energy-watchdog takes an ActualDown as corroboration that a
-// host it cannot see has really lost power, and a restarting pveproxy would have supplied it.
+// tcpProbe reports a load's power state by dialling it. Down means nothing answered; a
+// refusal means the host sent an RST, so its network stack is up and only the service behind
+// the port is gone. energy-watchdog reads ActualDown as corroboration that a host it cannot
+// see has lost power, so classifying a refusal as down would corroborate it falsely - a
+// restarting pveproxy is the likely source.
 //
-// The split is safe only while a genuinely powered-off host times out rather than refusing,
-// because ReconcileLoad fires WakeServer on ActualDown alone - anything that turned a dead
-// host's probe into a refusal would leave it unwakeable. Verified against a powered-off p1
-// from this pod's own network: an 8s dial to 10.1.1.11:8006 timed out, no RST. Worth
-// re-checking if the firewall in front of the pve hosts ever moves from DROP to REJECT.
+// Depends on a powered-off host timing out rather than refusing, since ReconcileLoad fires
+// WakeServer on ActualDown alone and a refusal would therefore leave it unwakeable. Verified
+// from this pod's network against a powered-off p1: an 8s dial to 10.1.1.11:8006 timed out,
+// no RST. Re-check if the firewall in front of the pve hosts moves from DROP to REJECT.
 func tcpProbe(addr string) control.ActualState {
 	conn, err := net.DialTimeout("tcp", addr, ioTimeout)
 	if err == nil {

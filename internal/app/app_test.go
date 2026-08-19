@@ -182,9 +182,8 @@ func (r *recordSink) PublishActual(a map[string]control.ActualState, at time.Tim
 	r.when = append(r.when, at)
 }
 
-// Every tick has to publish what it probed, or energy-watchdog's read of our state silently
-// answers "unknown" forever - and it then falls back to acting on the Proxmox cluster's word
-// alone, which is exactly the input that shed a healthy host.
+// Every tick must publish what it probed. Without it the state endpoint answers unknown
+// indefinitely and energy-watchdog falls back to the Proxmox reading alone.
 func TestTickPublishesWhatItProbed(t *testing.T) {
 	upsCfg := map[string]control.UPSConfig{"ups-a": {ShedRuntime: 300, RecoverCharge: 50}}
 	loads := map[string]control.LoadConfig{"p1": {Type: control.NutServer, GovernedBy: []string{"ups-a"}}}

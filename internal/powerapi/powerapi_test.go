@@ -143,14 +143,13 @@ func getState(s *Server, token, load string) *httptest.ResponseRecorder {
 	return w
 }
 
-// The state endpoint exists so energy-watchdog can tell "p1 is powered off" from "p1 is
-// unreachable through its Proxmox cluster". Our probe talks to the host itself, so a node
-// partitioned from corosync still reads up here - and that is the reading that stops a healthy
-// host being shed on the cluster's say-so.
+// The state endpoint lets energy-watchdog distinguish "p1 is powered off" from "p1 is
+// unreachable through its Proxmox cluster": the probe talks to the host directly, so a node
+// partitioned from corosync still reads up here.
 func TestStateServesTheLastProbe(t *testing.T) {
 	s := testServer(t)
 
-	// Before any tick: unknown, which commits the caller to nothing.
+	// Before any tick: unknown.
 	w := getState(s, "s3cret", "p1")
 	if w.Code != http.StatusOK {
 		t.Fatalf("get = %d: %s", w.Code, w.Body)
@@ -168,7 +167,7 @@ func TestStateServesTheLastProbe(t *testing.T) {
 	if !strings.Contains(body, `"actual":"up"`) {
 		t.Errorf("state = %s, want up", body)
 	}
-	// Age is computed here so the caller needs no agreement with our clock.
+	// Age is computed here, so it does not depend on the caller's clock.
 	if !strings.Contains(body, `"ageSeconds":20`) {
 		t.Errorf("state = %s, want ageSeconds 20", body)
 	}

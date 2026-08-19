@@ -45,10 +45,9 @@ type PowerRequests interface {
 	Desired() map[string]control.Request
 }
 
-// ActualSink receives each tick's probe results. It exists so the external controller can ask
-// what nut-dog actually sees: our probe reaches the host directly, so it stays right in the
-// cases where that controller's own view of a load goes wrong for reasons that have nothing
-// to do with power.
+// ActualSink receives each tick's probe results, so an external controller can read nut-dog's
+// direct view of a load rather than inferring power from a source that fails for other
+// reasons.
 type ActualSink interface {
 	PublishActual(map[string]control.ActualState, time.Time)
 }
@@ -67,7 +66,7 @@ type Controller struct {
 	// nil means every load follows its UPSes alone.
 	Requests PowerRequests
 
-	// Actual publishes each tick's probe results. Optional: nil simply serves nobody.
+	// Actual publishes each tick's probe results. Optional; nil disables publishing.
 	Actual ActualSink
 
 	// StartupGrace suppresses power-on actions for this long after StartClock, so a
