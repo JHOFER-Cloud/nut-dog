@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"io"
 	"log/slog"
@@ -432,13 +433,21 @@ func (r shedReader) ReadShed(load string) control.ShedState {
 	return effects.ParseShedStatus(vars["ups.status"])
 }
 
+// tcpProbe reports a load's power state by dialling it. Down means nothing answered at all;
+// a refusal is the opposite of that - something sent us an RST, so the host's network stack is
+// alive and only the service behind the port is gone. Calling that "down" would be a lie the
+// rest of the system now leans on: energy-watchdog takes an ActualDown as corroboration that a
+// host it cannot see has really lost power, and a restarting pveproxy would have supplied it.
 func tcpProbe(addr string) control.ActualState {
 	conn, err := net.DialTimeout("tcp", addr, ioTimeout)
-	if err != nil {
-		return control.ActualDown
+	if err == nil {
+		_ = conn.Close()
+		return control.ActualUp
 	}
-	_ = conn.Close()
-	return control.ActualUp
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return control.ActualUnknown
+	}
+	return control.ActualDown
 }
 
 // --- helpers ---
