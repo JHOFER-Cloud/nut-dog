@@ -438,6 +438,12 @@ func (r shedReader) ReadShed(load string) control.ShedState {
 // alive and only the service behind the port is gone. Calling that "down" would be a lie the
 // rest of the system now leans on: energy-watchdog takes an ActualDown as corroboration that a
 // host it cannot see has really lost power, and a restarting pveproxy would have supplied it.
+//
+// The split is safe only while a genuinely powered-off host times out rather than refusing,
+// because ReconcileLoad fires WakeServer on ActualDown alone - anything that turned a dead
+// host's probe into a refusal would leave it unwakeable. Verified against a powered-off p1
+// from this pod's own network: an 8s dial to 10.1.1.11:8006 timed out, no RST. Worth
+// re-checking if the firewall in front of the pve hosts ever moves from DROP to REJECT.
 func tcpProbe(addr string) control.ActualState {
 	conn, err := net.DialTimeout("tcp", addr, ioTimeout)
 	if err == nil {
