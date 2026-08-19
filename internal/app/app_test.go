@@ -171,3 +171,41 @@ func TestTickExternalRequest(t *testing.T) {
 		t.Errorf("requested on with an unknown UPS: got %+v, want none", applier2.got)
 	}
 }
+
+type recordSink struct {
+	got  []map[string]control.ActualState
+	when []time.Time
+}
+
+func (r *recordSink) PublishActual(a map[string]control.ActualState, at time.Time) {
+	r.got = append(r.got, a)
+	r.when = append(r.when, at)
+}
+
+// Every tick must publish what it probed. Without it the state endpoint answers unknown
+// indefinitely and energy-watchdog falls back to the Proxmox reading alone.
+func TestTickPublishesWhatItProbed(t *testing.T) {
+	upsCfg := map[string]control.UPSConfig{"ups-a": {ShedRuntime: 300, RecoverCharge: 50}}
+	loads := map[string]control.LoadConfig{"p1": {Type: control.NutServer, GovernedBy: []string{"ups-a"}}}
+	tel := mapPoller{"ups-a": {OK: true, Status: control.Status{OnLine: true}, Charge: 100}}
+	probe := mapProber{"p1": control.ActualUp}
+
+	sink := &recordSink{}
+	c := New(upsCfg, loads, tel, probe, &recordApplier{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Actual = sink
+	now := time.Now()
+	c.Now = func() time.Time { return now }
+
+	c.Tick()
+	c.Tick()
+
+	if len(sink.got) != 2 {
+		t.Fatalf("published %d times over two ticks, want 2", len(sink.got))
+	}
+	if sink.got[0]["p1"] != control.ActualUp {
+		t.Errorf("published %v for p1, want up", sink.got[0]["p1"])
+	}
+	if !sink.when[0].Equal(now) {
+		t.Errorf("published at %v, want the tick's own clock %v", sink.when[0], now)
+	}
+}

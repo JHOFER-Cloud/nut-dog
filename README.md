@@ -43,8 +43,16 @@ So energy-watchdog asks, over `powerAPI`:
 
 ```
 PUT /api/loads/p1/power   {"desired": "on" | "off" | "hold", "reason": "..."}
+GET /api/loads/p1/state   -> {"actual": "up" | "down" | "unknown", "ageSeconds": 3}
 Authorization: Bearer <token>
 ```
+
+The `GET` serves back what the last reconcile's probe saw. It exists because our probe
+answers a question the caller cannot answer for itself: it reaches the host directly, while
+energy-watchdog reads node state from the rest of the `pve` cluster, which reports a node
+partitioned from corosync exactly as it reports one that is switched off. Acting on that
+confusion shed a running host once. `ageSeconds` is computed here, so the caller needs no
+agreement with our clock to judge whether the reading is still worth anything.
 
 A request never outranks a UPS event. `DesiredForLoad` resolves it: a critical
 source sheds the load regardless of who wants it on; below that, `off` is honoured

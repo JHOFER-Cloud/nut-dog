@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"io"
 	"log/slog"
@@ -159,6 +160,7 @@ func main() {
 		}
 		api := powerapi.New(token, cfg.PowerAPI.Loads, time.Duration(*cfg.PowerAPI.RequestTTL), log)
 		ctrl.Requests = api
+		ctrl.Actual = api // and it can read back what we actually probe
 		powerSrv = startPowerAPI(cfg.PowerAPI.Listen, api, log)
 	}
 
@@ -277,8 +279,11 @@ func preflight(cfg *config.Config, poller nutPoller, racadm effects.RacadmChassi
 			report("cmc:"+name, err)
 		case config.TypeNutServer:
 			actual := prober.Probe(name)
+			// Unknown was unreachable before tcpProbe distinguished refusals, so this branch
+			// was dead. It now means the host answered with an RST: reachable, service down.
 			if actual == control.ActualUnknown {
-				log.Warn("preflight ✗", "check", "probe:"+name, "err", "unreachable")
+				log.Warn("preflight ✗", "check", "probe:"+name,
+					"err", "refused the connection: reachable, but nothing listening on the probe port")
 				fails++
 			} else {
 				log.Info("preflight ✓", "check", "probe:"+name, "state", actual == control.ActualUp)
@@ -431,13 +436,26 @@ func (r shedReader) ReadShed(load string) control.ShedState {
 	return effects.ParseShedStatus(vars["ups.status"])
 }
 
+// tcpProbe reports a load's power state by dialling it. Down means nothing answered; a
+// refusal means the host sent an RST, so its network stack is up and only the service behind
+// the port is gone. energy-watchdog reads ActualDown as corroboration that a host it cannot
+// see has lost power, so classifying a refusal as down would corroborate it falsely - a
+// restarting pveproxy is the likely source.
+//
+// Depends on a powered-off host timing out rather than refusing, since ReconcileLoad fires
+// WakeServer on ActualDown alone and a refusal would therefore leave it unwakeable. Verified
+// from this pod's network against a powered-off p1: an 8s dial to 10.1.1.11:8006 timed out,
+// no RST. Re-check if the firewall in front of the pve hosts moves from DROP to REJECT.
 func tcpProbe(addr string) control.ActualState {
 	conn, err := net.DialTimeout("tcp", addr, ioTimeout)
-	if err != nil {
-		return control.ActualDown
+	if err == nil {
+		_ = conn.Close()
+		return control.ActualUp
 	}
-	_ = conn.Close()
-	return control.ActualUp
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return control.ActualUnknown
+	}
+	return control.ActualDown
 }
 
 // --- helpers ---

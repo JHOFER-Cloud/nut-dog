@@ -30,6 +30,15 @@ type entry struct {
 	at  time.Time
 }
 
+// observation is the last probed power state for a load and when it was taken. Served so an
+// external controller can read nut-dog's direct view instead of inferring power from a source
+// with its own failure modes - Proxmox reports a node partitioned from its cluster as offline
+// whether or not the host is running.
+type observation struct {
+	state control.ActualState
+	at    time.Time
+}
+
 // Server holds the last request per load and serves the API. State is in memory
 // only: callers restate their wish every tick, so nothing here has to survive a
 // restart, and no stale file can hold a load down.
@@ -42,6 +51,7 @@ type Server struct {
 
 	mu   sync.Mutex
 	want map[string]entry
+	seen map[string]observation
 }
 
 // New builds a Server accepting requests for the named loads. A request older than
@@ -53,7 +63,18 @@ func New(token string, loads []string, ttl time.Duration, log *slog.Logger) *Ser
 	}
 	return &Server{
 		token: token, loads: known, ttl: ttl, now: time.Now, log: log,
-		want: map[string]entry{},
+		want: map[string]entry{}, seen: map[string]observation{},
+	}
+}
+
+// PublishActual records one reconcile tick's probe results, implementing app.ActualSink.
+// Entries do not expire: the age is served alongside the state so the caller applies its own
+// freshness bound rather than this end silently downgrading a stale reading to unknown.
+func (s *Server) PublishActual(actual map[string]control.ActualState, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for load, st := range actual {
+		s.seen[load] = observation{state: st, at: at}
 	}
 }
 
@@ -81,7 +102,39 @@ func (s *Server) Desired() map[string]control.Request {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/loads/{load}/power", s.handlePower)
+	mux.HandleFunc("GET /api/loads/{load}/state", s.handleState)
 	return mux
+}
+
+// handleState serves the load's last probed power state. ageSeconds is computed here rather
+// than shipping a timestamp, so freshness does not depend on the caller's clock agreeing with
+// ours.
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	if !s.authorised(r) {
+		s.log.Warn("state request rejected: bad token", "remote", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	load := r.PathValue("load")
+	if !s.loads[load] {
+		http.Error(w, "unknown load", http.StatusNotFound)
+		return
+	}
+	s.mu.Lock()
+	o, ok := s.seen[load]
+	s.mu.Unlock()
+
+	body := struct {
+		Actual     string `json:"actual"`
+		AgeSeconds int    `json:"ageSeconds"`
+	}{Actual: control.ActualUnknown.String()}
+	if ok {
+		// Before the first tick the zero value stands, which is unknown - no opinion.
+		body.Actual = o.state.String()
+		body.AgeSeconds = int(s.now().Sub(o.at).Seconds())
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {

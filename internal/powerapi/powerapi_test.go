@@ -132,3 +132,58 @@ func TestZeroTTLNeverExpires(t *testing.T) {
 		t.Error("request expired with the TTL disabled")
 	}
 }
+
+func getState(s *Server, token, load string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/api/loads/"+load+"/state", nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// The state endpoint lets energy-watchdog distinguish "p1 is powered off" from "p1 is
+// unreachable through its Proxmox cluster": the probe talks to the host directly, so a node
+// partitioned from corosync still reads up here.
+func TestStateServesTheLastProbe(t *testing.T) {
+	s := testServer(t)
+
+	// Before any tick: unknown.
+	w := getState(s, "s3cret", "p1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("get = %d: %s", w.Code, w.Body)
+	}
+	if got := w.Body.String(); !strings.Contains(got, `"actual":"unknown"`) {
+		t.Errorf("fresh server state = %s, want unknown", got)
+	}
+
+	now := time.Now()
+	s.now = func() time.Time { return now.Add(20 * time.Second) }
+	s.PublishActual(map[string]control.ActualState{"p1": control.ActualUp}, now)
+
+	w = getState(s, "s3cret", "p1")
+	body := w.Body.String()
+	if !strings.Contains(body, `"actual":"up"`) {
+		t.Errorf("state = %s, want up", body)
+	}
+	// Age is computed here, so it does not depend on the caller's clock.
+	if !strings.Contains(body, `"ageSeconds":20`) {
+		t.Errorf("state = %s, want ageSeconds 20", body)
+	}
+}
+
+func TestStateNeedsTheTokenAndAKnownLoad(t *testing.T) {
+	s := testServer(t)
+	s.PublishActual(map[string]control.ActualState{"p1": control.ActualUp}, time.Now())
+
+	if w := getState(s, "", "p1"); w.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated get = %d, want 401", w.Code)
+	}
+	if w := getState(s, "wrong", "p1"); w.Code != http.StatusUnauthorized {
+		t.Errorf("bad-token get = %d, want 401", w.Code)
+	}
+	if w := getState(s, "s3cret", "nope"); w.Code != http.StatusNotFound {
+		t.Errorf("unknown load = %d, want 404", w.Code)
+	}
+}
