@@ -279,8 +279,12 @@ func preflight(cfg *config.Config, poller nutPoller, racadm effects.RacadmChassi
 			report("cmc:"+name, err)
 		case config.TypeNutServer:
 			actual := prober.Probe(name)
+			// Unknown used to be unreachable here, because the probe only ever answered up or
+			// down. It now also means the host refused the connection - which proves it is
+			// reachable and only its service is down, the opposite of what this used to report.
 			if actual == control.ActualUnknown {
-				log.Warn("preflight ✗", "check", "probe:"+name, "err", "unreachable")
+				log.Warn("preflight ✗", "check", "probe:"+name,
+					"err", "refused the connection: reachable, but nothing listening on the probe port")
 				fails++
 			} else {
 				log.Info("preflight ✓", "check", "probe:"+name, "state", actual == control.ActualUp)

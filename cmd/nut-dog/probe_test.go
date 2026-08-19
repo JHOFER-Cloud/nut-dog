@@ -22,8 +22,12 @@ func TestProbeTreatsARefusalAsNotDown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := tcpProbe(addr); got == control.ActualDown {
-		t.Errorf("probe of a refusing host = down; the host answered, only the port is shut")
+	// Asserting the exact value, not merely "not down": reporting a refusal as *up* is its own
+	// hazard, since energy-watchdog never believes a node is gone while this says up - one
+	// pveproxy restart would then pin p1 in that hold for as long as it lasted.
+	if got := tcpProbe(addr); got != control.ActualUnknown {
+		t.Errorf("probe of a refusing host = %v, want unknown: it answered, so it is not down,"+
+			" but a shut port is no evidence that it is up either", got)
 	}
 }
 
