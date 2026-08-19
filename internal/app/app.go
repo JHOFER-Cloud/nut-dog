@@ -45,6 +45,14 @@ type PowerRequests interface {
 	Desired() map[string]control.Request
 }
 
+// ActualSink receives each tick's probe results. It exists so the external controller can ask
+// what nut-dog actually sees: our probe reaches the host directly, so it stays right in the
+// cases where that controller's own view of a load goes wrong for reasons that have nothing
+// to do with power.
+type ActualSink interface {
+	PublishActual(map[string]control.ActualState, time.Time)
+}
+
 // Controller holds everything one reconcile Tick needs.
 type Controller struct {
 	UPSConfigs map[string]control.UPSConfig
@@ -58,6 +66,9 @@ type Controller struct {
 	// Requests is the external controller's wanted power state per load. Optional:
 	// nil means every load follows its UPSes alone.
 	Requests PowerRequests
+
+	// Actual publishes each tick's probe results. Optional: nil simply serves nobody.
+	Actual ActualSink
 
 	// StartupGrace suppresses power-on actions for this long after StartClock, so a
 	// restart doesn't wake a load the external controller wants off before its
@@ -138,11 +149,14 @@ func (c *Controller) Tick() {
 		}
 		for _, l := range c.loadNames {
 			if c.Loads[l].Type == control.NutServer {
-				c.Log.Info("load", "name", l, "actual", actualString(actual[l]), "shed", shedString(shed[l]))
+				c.Log.Info("load", "name", l, "actual", actual[l].String(), "shed", shedString(shed[l]))
 			} else {
-				c.Log.Info("load", "name", l, "actual", actualString(actual[l]))
+				c.Log.Info("load", "name", l, "actual", actual[l].String())
 			}
 		}
+	}
+	if c.Actual != nil {
+		c.Actual.PublishActual(actual, c.now()())
 	}
 	ext := c.requested()
 	c.record(tel, actual, shed, ext)
@@ -232,17 +246,6 @@ func statusString(s control.Status) string {
 		return "?"
 	}
 	return strings.Join(parts, " ")
-}
-
-func actualString(a control.ActualState) string {
-	switch a {
-	case control.ActualUp:
-		return "up"
-	case control.ActualDown:
-		return "down"
-	default:
-		return "unknown"
-	}
 }
 
 func shedString(s control.ShedState) string {

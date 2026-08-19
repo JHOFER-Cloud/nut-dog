@@ -30,6 +30,15 @@ type entry struct {
 	at  time.Time
 }
 
+// observation is the last power state the reconcile loop probed for a load, and when. It is
+// served so another controller can ask nut-dog what it actually sees rather than inferring a
+// load's power from something that can fail for its own reasons - a Proxmox node partitioned
+// from its cluster reads as offline there while the host itself is up and serving.
+type observation struct {
+	state control.ActualState
+	at    time.Time
+}
+
 // Server holds the last request per load and serves the API. State is in memory
 // only: callers restate their wish every tick, so nothing here has to survive a
 // restart, and no stale file can hold a load down.
@@ -42,6 +51,7 @@ type Server struct {
 
 	mu   sync.Mutex
 	want map[string]entry
+	seen map[string]observation
 }
 
 // New builds a Server accepting requests for the named loads. A request older than
@@ -53,7 +63,18 @@ func New(token string, loads []string, ttl time.Duration, log *slog.Logger) *Ser
 	}
 	return &Server{
 		token: token, loads: known, ttl: ttl, now: time.Now, log: log,
-		want: map[string]entry{},
+		want: map[string]entry{}, seen: map[string]observation{},
+	}
+}
+
+// PublishActual records one reconcile tick's probe results, implementing app.ActualSink.
+// Nothing here expires: the age is served alongside the state and the caller decides what is
+// too old, which beats this end silently turning a stale reading into "unknown".
+func (s *Server) PublishActual(actual map[string]control.ActualState, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for load, st := range actual {
+		s.seen[load] = observation{state: st, at: at}
 	}
 }
 
@@ -81,7 +102,40 @@ func (s *Server) Desired() map[string]control.Request {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/loads/{load}/power", s.handlePower)
+	mux.HandleFunc("GET /api/loads/{load}/state", s.handleState)
 	return mux
+}
+
+// handleState serves the load's last probed power state. ageSeconds is computed here rather
+// than shipping a timestamp, so the caller needs no agreement with our clock to judge whether
+// the reading is fresh enough to act on.
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	if !s.authorised(r) {
+		s.log.Warn("state request rejected: bad token", "remote", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	load := r.PathValue("load")
+	if !s.loads[load] {
+		http.Error(w, "unknown load", http.StatusNotFound)
+		return
+	}
+	s.mu.Lock()
+	o, ok := s.seen[load]
+	s.mu.Unlock()
+
+	body := struct {
+		Actual     string `json:"actual"`
+		AgeSeconds int    `json:"ageSeconds"`
+	}{Actual: control.ActualUnknown.String()}
+	if ok {
+		// A tick has run: report what it saw. Before that the zero value stands, which is
+		// "unknown" - the answer that commits the caller to nothing.
+		body.Actual = o.state.String()
+		body.AgeSeconds = int(s.now().Sub(o.at).Seconds())
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {

@@ -190,6 +190,17 @@ const (
 	ActualDown
 )
 
+func (a ActualState) String() string {
+	switch a {
+	case ActualUp:
+		return "up"
+	case ActualDown:
+		return "down"
+	default:
+		return "unknown"
+	}
+}
+
 // ShedState is the observed position of a NUT server's shed signal — the
 // ups.status nut-dog last drove onto that server's dummy-ups, read back from the
 // local upsd. Knowing it lets the reconcile stay edge-triggered like the chassis:

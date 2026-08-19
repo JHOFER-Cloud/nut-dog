@@ -159,6 +159,7 @@ func main() {
 		}
 		api := powerapi.New(token, cfg.PowerAPI.Loads, time.Duration(*cfg.PowerAPI.RequestTTL), log)
 		ctrl.Requests = api
+		ctrl.Actual = api // and it can read back what we actually probe
 		powerSrv = startPowerAPI(cfg.PowerAPI.Listen, api, log)
 	}
 
