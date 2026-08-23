@@ -14,7 +14,7 @@
 ARG NUT_VERSION=2.8.5
 ARG NUT_SHA256=18bf32e59eb764b13da3c4fa70384926d7fa584cb31d2fe7f137a570633eeec1
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
