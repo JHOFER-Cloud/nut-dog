@@ -32,10 +32,12 @@ func connect(addr string, opts Options, timeout time.Duration) (net.Conn, *bufio
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 
 	if opts.TLS {
-		if conn, err = startTLS(conn, addr, opts.InsecureSkipVerify); err != nil {
+		tc, err := startTLS(conn, addr, opts.InsecureSkipVerify)
+		if err != nil {
 			_ = conn.Close()
 			return nil, nil, err
 		}
+		conn = tc
 		_ = conn.SetDeadline(time.Now().Add(timeout))
 	}
 
