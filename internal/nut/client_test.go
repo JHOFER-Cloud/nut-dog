@@ -2,8 +2,10 @@ package nut
 
 import (
 	"bufio"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCollectVars(t *testing.T) {
@@ -37,6 +39,32 @@ func TestCollectVarsError(t *testing.T) {
 	_, err := collectVars(bufio.NewReader(strings.NewReader("ERR ACCESS-DENIED\n")), "nut")
 	if err == nil || !strings.Contains(err.Error(), "ACCESS-DENIED") {
 		t.Fatalf("want ACCESS-DENIED error, got %v", err)
+	}
+}
+
+// A server that refuses STARTTLS must surface an error, not panic: startTLS
+// returns a nil conn on every failure path, so the cleanup must not touch it.
+func TestConnectSTARTTLSRefused(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("ERR FEATURE-NOT-SUPPORTED\n"))
+	}()
+
+	_, _, err = connect(ln.Addr().String(), Options{TLS: true}, 2*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "STARTTLS refused") {
+		t.Fatalf("want STARTTLS refused error, got %v", err)
 	}
 }
 
