@@ -86,7 +86,7 @@ jobs:
       # action pulls in (semantic-release ^25 -> generator 14) depends on writer@^8. The pair
       # fails in generateNotes with `Missing helper`. Raise it once the generator ships a
       # major built on writer@9.
-      - uses: cycjimmy/semantic-release-action@v6.0.0
+      - uses: cycjimmy/semantic-release-action@v7.1.2
         with:
           extra_plugins: |
             @semantic-release/exec
